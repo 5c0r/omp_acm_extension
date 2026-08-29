@@ -7,12 +7,15 @@ def test_ingest_worker_persists_detail_and_skips_duplicate_digest():
     script = """
 import time
 import uuid
-import os
 
-os.environ["ACM_OLLAMA_URL"] = "http://127.0.0.1:1"
-from acm import db
-from acm.ingest import start_worker, status, submit
+from acm import db, ingest
 
+ingest._extract = lambda _scope_id, _text: {
+    "memories": [{"kind": "fact", "content": "We upgraded from Starter to Pro on April 3.", "importance": 0.5, "entities": []}],
+    "relations": [],
+}
+ingest._embedding = lambda _content: None
+start_worker, status, submit = ingest.start_worker, ingest.status, ingest.submit
 start_worker()
 scope = "project:ingest-" + uuid.uuid4().hex
 text = "We upgraded from Starter to Pro on April 3."
@@ -58,6 +61,38 @@ for _ in range(100):
         break
     time.sleep(0.1)
 assert current["status"] == "skipped", current
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_ingest_worker_marks_unavailable_extraction_failed_without_memory():
+    """Fails if unavailable extraction persists the original transcript as a fact."""
+    script = """
+import time
+import uuid
+import os
+
+os.environ["ACM_OLLAMA_URL"] = "http://127.0.0.1:1"
+from acm import db
+from acm.ingest import start_worker, status, submit
+
+start_worker()
+scope = "project:extraction-failure-" + uuid.uuid4().hex
+job = submit(scope, "A transcript must not become one durable fact.", "test")
+for _ in range(100):
+    current = status(job)
+    if current["status"] != "pending":
+        break
+    time.sleep(0.1)
+assert current["status"] == "failed", current
+assert current["result"] == {"reason": "extraction unavailable"}, current
+
+scope_id = db.get_or_create_scope("project", scope.split(":", 1)[1])
+with db.connect() as conn:
+    count = conn.execute("SELECT count(*) AS count FROM memory WHERE scope_id = %s", (scope_id,)).fetchone()["count"]
+assert count == 0, count
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
 

@@ -26,24 +26,44 @@ type BrowseMemory = {
   status: string;
   importance: number;
   pinned: boolean;
-  entities?: Array<{ id: number; canonical_name: string }>;
+  entities?: Array<{ id: number; canonical_name: string; aliases?: string[] }>;
 };
 
+const MAX_HARVEST_BYTES = 24 * 1024;
+
+function textContent(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return undefined;
+  const text = value.flatMap(block => {
+    if (typeof block !== "object" || block === null) return [];
+    const item = block as { type?: unknown; text?: unknown };
+    return item.type === "text" && typeof item.text === "string" ? [item.text] : [];
+  }).join("\n");
+  return text.trim() ? text : undefined;
+}
+
 function messages(messages: readonly unknown[]): MessagePayload[] {
-  return messages.map(message => {
-    if (typeof message === "object" && message !== null) {
-      const value = message as { role?: unknown; content?: unknown; summary?: unknown };
-      const role = typeof value.role === "string" ? value.role : "unknown";
-      const isCompactionSummary = role === "compactionSummary";
-      const content = typeof value.content === "string"
-        ? value.content
-        : isCompactionSummary && typeof value.summary === "string"
-          ? value.summary
-          : JSON.stringify(value.content) ?? "";
-      return { role: isCompactionSummary ? "assistant" : role, content };
-    }
-    return { role: "unknown", content: String(message) };
+  return messages.flatMap(message => {
+    if (typeof message !== "object" || message === null) return [];
+    const value = message as { role?: unknown; content?: unknown; summary?: unknown };
+    const role = typeof value.role === "string" ? value.role : "unknown";
+    const content = role === "compactionSummary" && typeof value.summary === "string"
+      ? value.summary
+      : textContent(value.content);
+    return content?.trim() ? [{ role: role === "compactionSummary" ? "assistant" : role, content }] : [];
   });
+}
+
+function capHarvestText(text: string): string {
+  let bytes = 0;
+  for (let index = 0; index < text.length;) {
+    const codePoint = text.codePointAt(index)!;
+    const width = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (bytes + width > MAX_HARVEST_BYTES) return text.slice(0, index);
+    bytes += width;
+    index += codePoint > 0xffff ? 2 : 1;
+  }
+  return text;
 }
 
 function fileOps(value: unknown): { read: string[]; written: string[]; edited: string[] } {
@@ -341,6 +361,7 @@ export default function acmExtension(pi: ExtensionAPI) {
             "Set importance",
             "Merge into…",
             "Add alias",
+            ...(current.entities?.some(entity => entity.aliases?.length) ? ["Remove alias"] : []),
             "Done",
           ]);
           if (!action || action === "Done") return;
@@ -394,10 +415,19 @@ export default function acmExtension(pi: ExtensionAPI) {
             ctx.ui.notify("ACM browse: no linked entities.", "info");
             continue;
           }
-          const entityLabel = await ctx.ui.select("Add alias to entity", entities.map(entity => `#${entity.id} ${entity.canonical_name}`));
+          const entityLabel = await ctx.ui.select(
+            action === "Remove alias" ? "Remove alias from entity" : "Add alias to entity",
+            entities.map(entity => `#${entity.id} ${entity.canonical_name}`),
+          );
           const entity = entities.find(candidate => `#${candidate.id} ${candidate.canonical_name}` === entityLabel);
-          const alias = entity && await ctx.ui.input(`Alias for ${entity.canonical_name}`);
-          if (entity && alias?.trim()) await acmRequest(`/entities/${entity.id}/aliases`, "POST", { alias });
+          if (!entity) continue;
+          if (action === "Remove alias") {
+            const alias = await ctx.ui.select(`Remove alias from ${entity.canonical_name}`, entity.aliases ?? []);
+            if (alias && await acmRequest(`/entities/${entity.id}/aliases`, "DELETE", { alias })) current = await refresh(current);
+            continue;
+          }
+          const alias = await ctx.ui.input(`Alias for ${entity.canonical_name}`);
+          if (alias?.trim() && await acmRequest(`/entities/${entity.id}/aliases`, "POST", { alias })) current = await refresh(current);
         }
       }
       if (command === "selfcheck") {
@@ -528,7 +558,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     });
     if (!additions.length) return;
     harvested.set(sessionId, seen);
-    const transcript = additions.map(message => `${message.role}: ${message.content}`).join("\n");
+    const transcript = capHarvestText(additions.map(message => `${message.role}: ${message.content}`).join("\n"));
     ctx.setTimeout(
       async () => {
         const result = await acmRequest<{ job_id?: unknown }>("/ingest", "POST", {

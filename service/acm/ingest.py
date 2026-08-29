@@ -91,7 +91,7 @@ def _embedding(content: str) -> list[float] | None:
     return vector if len(vector) == db.EMBED_DIM else None
 
 
-def _extract(scope_id: int, text: str) -> dict[str, Any]:
+def _extract(scope_id: int, text: str) -> dict[str, Any] | None:
     architecture = generate_architecture("conversation and project context", scope_id=scope_id)
     extracted = chat_json(
         "Extract durable memories faithfully. Do not infer details not stated.",
@@ -100,8 +100,7 @@ def _extract(scope_id: int, text: str) -> dict[str, Any]:
     )
     if isinstance(extracted, dict) and isinstance(extracted.get("memories"), list) and extracted["memories"]:
         return extracted
-    # ponytail: retain source text as one fact when model unavailable; richer extraction resumes automatically.
-    return {"memories": [{"kind": "fact", "content": text, "importance": 0.5, "entities": []}], "relations": []}
+    return None
 
 
 def _memory(scope_id: int, item: dict[str, Any], source_ref: str | None) -> int | None:
@@ -217,6 +216,9 @@ def _process(job_id: int) -> None:
         return
 
     extracted = _extract(job["scope_id"], text)
+    if extracted is None:
+        _finish(job_id, "failed", {"reason": "extraction unavailable"})
+        return
     memory_ids: list[int] = []
     entities: dict[str, int] = {}
     for item in extracted["memories"]:

@@ -336,6 +336,42 @@ test("/acm browse retains linked entities after a memory mutation", async () => 
   }
 });
 
+test("/acm browse removes a selected entity alias", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
+  const selections = ["project:browse-live — 1 memories", "#41 [fact] Widget API key rotates weekly — active", "Remove alias", "#9 widget", "widget-live", "Done"];
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [{ id: 9, canonical_name: "widget", aliases: ["widget-live"] }] }));
+    return new Response(JSON.stringify({ id: 9, canonical_name: "widget", aliases: [] }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async () => selections.shift(),
+        input: async () => undefined,
+        notify: () => undefined,
+      },
+    } as never);
+    expect(requests).toContainEqual({
+      url: "http://localhost:8927/entities/9/aliases",
+      method: "DELETE",
+      body: { alias: "widget-live" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("/acm selfcheck exercises every ACM endpoint", async () => {
   const { commandHandlers } = extensionStub();
   const handler = commandHandlers.acm;
@@ -1121,6 +1157,59 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
       "acm",
       "ACM full · bundle ✓0 ✗0 · ingest 5 · last compact —",
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
+test("agent end harvests only text blocks and caps the ingest payload", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { handlers } = extensionStub();
+  const agentEnd = handlers.agent_end;
+  expect(agentEnd).toBeTypeOf("function");
+  if (!agentEnd) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ body: Record<string, unknown> }> = [];
+  const timers: Array<() => Promise<void>> = [];
+  globalThis.fetch = async (_url, init) => {
+    requests.push({ body: JSON.parse(String(init?.body)) });
+    return new Response(JSON.stringify({ job_id: 1 }), { status: 200 });
+  };
+  try {
+    await agentEnd(
+      {
+        messages: [
+          { role: "assistant", content: [
+            { type: "thinking", thinking: "private-reasoning" },
+            { type: "tool_use", name: "write", input: { path: "secret" } },
+            { type: "text", text: "Durable response." },
+            { type: "tool_result", content: "private-result" },
+          ] },
+          { role: "user", content: [{ type: "tool_result", content: "ignore this" }] },
+          { role: "user", content: [{ type: "text", text: "x".repeat(30_000) }] },
+        ],
+      } as never,
+      {
+        cwd: process.cwd(),
+        hasUI: true,
+        sessionManager: { getSessionId: () => "filtered-harvest" },
+        setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+        ui: { setStatus: () => undefined },
+      } as never,
+    );
+    await timers[0]?.();
+    const text = String(requests[0]?.body.text);
+    expect(text).toContain("assistant: Durable response.");
+    expect(text).not.toContain("thinking");
+    expect(text).not.toContain("tool_use");
+    expect(text).not.toContain("tool_result");
+    expect(text).not.toContain("private-reasoning");
+    expect(text).not.toContain("private-result");
+    expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(24 * 1024);
   } finally {
     globalThis.fetch = originalFetch;
     if (previousWidget === undefined) delete process.env.ACM_WIDGET;
