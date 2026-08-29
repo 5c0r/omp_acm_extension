@@ -62,7 +62,7 @@ Select a preset at OMP startup with `omp --acm-mode=<mode>` or `ACM_MODE=<mode> 
 
 | Environment | Default | Effect |
 |---|---|---|
-| `ACM_WIDGET` | on | Set `0` to disable the interactive status widget. |
+| `ACM_WIDGET` | on | Set `0` to disable ACM footer status line (env name kept for compatibility). Session start probes health then renders `ACM <mode> · ready` or `offline`; activity counts advance only after verified ACM responses. |
 
 OMP extensions cannot read arbitrary `config.yml` keys; use flag or env until OMP core exposes extension settings. `compaction` leaves memory ownership to Hindsight/Mnemopi; no Hindsight-to-ACM bridge exists.
 

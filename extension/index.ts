@@ -116,20 +116,22 @@ function toolResult(response: unknown) {
 
 
 
-export type WidgetState = {
+export type StatusState = {
   mode: AcmMode;
   bundleHits: number;
   bundleMisses: number;
   ingestCount: number;
   lastCompaction?: CompactResponse;
+  online?: boolean;
 };
 
-export function renderWidget(state: WidgetState): string[] {
+export function renderStatusLine(state: StatusState): string {
+  if (state.online === false) return `ACM ${state.mode} · offline`;
   const bundle = state.mode === "compaction" ? "—" : `✓${state.bundleHits} ✗${state.bundleMisses}`;
   const compact = state.lastCompaction
     ? `${state.lastCompaction.validation_score.toFixed(2)}/${state.lastCompaction.compression_ratio.toFixed(2)}`
     : "—";
-  return [`ACM ${state.mode} · bundle ${bundle} · ingest ${state.ingestCount} · last compact ${compact}`];
+  return `ACM ${state.mode} · bundle ${bundle} · ingest ${state.ingestCount} · last compact ${compact}`;
 }
 
 
@@ -143,22 +145,40 @@ export default function acmExtension(pi: ExtensionAPI) {
   let autoInject = process.env.ACM_AUTO_INJECT !== "0";
   const autoArmEnabled = process.env.ACM_AUTO_ARM === "1";
   let lastCompaction: CompactResponse | undefined;
-  const autoWidget = process.env.ACM_WIDGET !== "0";
+  const statusLineEnabled = process.env.ACM_WIDGET !== "0";
   let bundleHits = 0;
   let bundleMisses = 0;
   let ingestCount = 0;
-  let lastWidgetLine: string | undefined;
-  const updateWidget = (ctx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[], options?: { placement?: "belowEditor" }) => void } }) => {
-    if (!autoWidget || !ctx.hasUI) return;
-    const [line] = renderWidget({ mode: getMode().mode, bundleHits, bundleMisses, ingestCount, lastCompaction });
-    if (line === lastWidgetLine) return;
+  let serviceOnline: boolean | undefined;
+  let lastStatusLine: string | undefined;
+  const setStatusBar = (
+    ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } },
+    text: string,
+  ) => {
+    if (!statusLineEnabled || !ctx.hasUI || !ctx.ui?.setStatus) return;
     try {
-      ctx.ui.setWidget("acm", [line], { placement: "belowEditor" });
-      lastWidgetLine = line;
+      ctx.ui.setStatus("acm", text);
+      lastStatusLine = text;
     } catch {
-      // ponytail: widget is cosmetic — a failing UI surface must never break the handler
+      // ponytail: status line is cosmetic — a failing UI surface must never break the handler
     }
   };
+  const updateStatus = (ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } }) => {
+    const line = renderStatusLine({
+      mode: getMode().mode,
+      bundleHits,
+      bundleMisses,
+      ingestCount,
+      lastCompaction,
+      online: serviceOnline,
+    });
+    if (line !== lastStatusLine) setStatusBar(ctx, line);
+  };
+  pi.on("session_start", async (_event, ctx) => {
+    if (!statusLineEnabled || !ctx.hasUI) return;
+    serviceOnline = (await acmRequest("/health")) !== null;
+    setStatusBar(ctx, `ACM ${getMode().mode} · ${serviceOnline ? "ready" : "offline"}`);
+  });
   const z = pi.zod;
 
   pi.registerTool({
@@ -215,8 +235,9 @@ export default function acmExtension(pi: ExtensionAPI) {
         custom_instructions: params.custom_instructions,
       }, signal);
       if (response?.validation_score >= 0.8) {
+        serviceOnline = true;
         lastCompaction = response;
-        updateWidget(ctx);
+        updateStatus(ctx);
       }
       return toolResult(response);
     },
@@ -335,8 +356,9 @@ export default function acmExtension(pi: ExtensionAPI) {
       budget_tokens: 1500,
     }, event.signal);
     if (!response || response.validation_score < 0.8) return {};
+    serviceOnline = true;
     lastCompaction = response;
-    updateWidget(ctx);
+    updateStatus(ctx);
     return {
       compaction: {
         summary: response.summary,
@@ -393,16 +415,18 @@ export default function acmExtension(pi: ExtensionAPI) {
     });
     if (!additions.length) return;
     harvested.set(sessionId, seen);
-    ingestCount += additions.length;
-    updateWidget(ctx);
     const transcript = additions.map(message => `${message.role}: ${message.content}`).join("\n");
     ctx.setTimeout(
       async () => {
-        await acmRequest("/ingest", "POST", {
+        const result = await acmRequest<{ job_id?: unknown }>("/ingest", "POST", {
           scope: projectScope(ctx.cwd),
           source_ref: `session:${sessionId}`,
           text: transcript,
         });
+        if (typeof result?.job_id !== "number") return;
+        serviceOnline = true;
+        ingestCount += additions.length;
+        updateStatus(ctx);
       },
       0,
     );
@@ -414,17 +438,20 @@ export default function acmExtension(pi: ExtensionAPI) {
     if (user) latestUser.set(sessionId, user.content);
     const mode = getMode();
     if (!mode.anticipate || !autoInject) {
-      updateWidget(ctx);
+      updateStatus(ctx);
       return {};
     }
     const bundle = await acmRequest<{ rendered?: unknown }>(`/bundle/${sessionId}`);
     if (typeof bundle?.rendered !== "string" || !bundle.rendered.trim()) {
-      bundleMisses += 1;
-      updateWidget(ctx);
+      if (serviceOnline !== false) {
+        bundleMisses += 1;
+        updateStatus(ctx);
+      }
       return {};
     }
+    serviceOnline = true;
     bundleHits += 1;
-    updateWidget(ctx);
+    updateStatus(ctx);
     return { messages: [{ role: "user", content: bundle.rendered }, ...event.messages] };
   });
 }
