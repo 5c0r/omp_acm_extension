@@ -222,6 +222,7 @@ test("turn end queues a bounded trajectory for anticipation", async () => {
   const timers: Array<() => Promise<void>> = [];
   const ctx = {
     cwd: "/tmp/acm-turn",
+    getContextUsage: () => undefined,
     sessionManager: { getSessionId: () => "session-4" },
     setTimeout: (callback: () => Promise<void>) => timers.push(callback),
   };
@@ -254,7 +255,63 @@ test("turn end queues a bounded trajectory for anticipation", async () => {
   }
 });
 
-test("validated compaction keeps unrelated preserve data but discards stale compaction payloads", async () => {
+test("turn end arms a branch snapshot above the context threshold", async () => {
+  const { handlers } = extensionStub();
+  const turnEndHandler = handlers.turn_end;
+  expect(turnEndHandler).toBeTypeOf("function");
+  if (!turnEndHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const timers: Array<() => Promise<void>> = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return new Response("{}");
+  };
+  try {
+    await turnEndHandler(
+      { message: { role: "assistant", content: "Ready to compact." }, toolResults: [] },
+      {
+        cwd: process.cwd(),
+        getContextUsage: () => ({ tokens: 61, contextWindow: 100 }),
+        sessionManager: {
+          getSessionId: () => "session-armed",
+          getBranch: () => [
+            { type: "message", message: { role: "user", content: "Pre-compaction history." } },
+            { type: "compaction", summary: "Previous validated summary." },
+            { type: "message", message: { role: "user", content: "Keep billing decision." } },
+            { type: "message", message: { role: "assistant", content: "Ready to compact." } },
+          ],
+        },
+        setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+      },
+    );
+    expect(timers).toHaveLength(2);
+    await timers[0]?.();
+    await timers[1]?.();
+    expect(requests[1]).toMatchObject({
+      url: "http://localhost:8927/compact",
+      body: {
+        scope: "project:feat-acm-omp-extension",
+        conversation: [
+          { role: "user", content: "Keep billing decision." },
+          { role: "assistant", content: "Ready to compact." },
+        ],
+        turn_prefix: null,
+        previous_summary: "Previous validated summary.",
+        file_ops: { read: [], written: [], edited: [] },
+        custom_instructions: null,
+        budget_tokens: 1500,
+        async: true,
+        from_extension: true,
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("armed compaction match keeps unrelated preserve data but discards stale payloads", async () => {
   const { handlers } = extensionStub();
   const compactHandler = handlers.session_before_compact;
 
@@ -285,20 +342,20 @@ test("validated compaction keeps unrelated preserve data but discards stale comp
           tokensBefore: 42,
         },
       },
-      {},
+      { cwd: process.cwd() },
     );
 
     expect(requests).toEqual([
       {
-        url: "http://localhost:8927/compact",
+        url: "http://localhost:8927/compact/match",
         body: {
+          scope: "project:feat-acm-omp-extension",
           conversation: [{ role: "user", content: "history" }],
           turn_prefix: [{ role: "assistant", content: "split turn" }],
           previous_summary: "earlier",
           custom_instructions: "keep deployment details",
           file_ops: { read: ["deploy.ts"], written: [], edited: ["deploy.ts"] },
           budget_tokens: 1500,
-
         },
       },
     ]);
@@ -354,7 +411,7 @@ test("context prepends only a ready session bundle", async () => {
 });
 
 if (process.env.ACM_LIVE_TEST === "1") {
-  test("live compact hook completes below OMP's 30-second handler cap", async () => {
+  test("live armed match hook completes below OMP's 30-second handler cap", async () => {
     const { handlers } = extensionStub();
     const compactHandler = handlers.session_before_compact;
     expect(compactHandler).toBeTypeOf("function");
@@ -363,24 +420,49 @@ if (process.env.ACM_LIVE_TEST === "1") {
       role: index % 2 ? "assistant" : "user",
       content: `Turn ${index}: analyst team-${index} recorded metric-${index} on 2026-05-${String(index + 1).padStart(2, "0")}, prefers policy-${index}, and reviewed src/module-${index}.ts.`,
     }));
-    const started = performance.now();
-    const result = await compactHandler({
-      signal: new AbortController().signal,
-      preparation: {
-        messagesToSummarize: messages,
-        turnPrefixMessages: [],
-        fileOps: { read: new Set(["src/billing.ts"]), written: new Set(["config/rollout.yaml"]), edited: new Set() },
-        firstKeptEntryId: "entry-live",
-        tokensBefore: 2000,
-      },
-    } as never, {} as never);
+    const fileOps = { read: ["src/billing.ts"], written: ["config/rollout.yaml"], edited: [] };
+    const project = `live-${crypto.randomUUID()}`;
+    const scope = `project:${project}`;
+    const arm = await fetch("http://localhost:8927/compact", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        scope,
+        conversation: messages,
+        turn_prefix: null,
+        previous_summary: null,
+        custom_instructions: null,
+        file_ops: fileOps,
+        budget_tokens: 1500,
+        async: true,
+        from_extension: true,
+      }),
+    });
+    expect(arm.status).toBe(202);
+    const deadline = performance.now() + 60_000;
+    let result: unknown = {};
+    while (performance.now() < deadline) {
+      const handlerStarted = performance.now();
+      result = await compactHandler({
+        signal: new AbortController().signal,
+        preparation: {
+          messagesToSummarize: messages,
+          turnPrefixMessages: [],
+          fileOps: { read: new Set(fileOps.read), written: new Set(fileOps.written), edited: new Set() },
+          firstKeptEntryId: "entry-live",
+          tokensBefore: 2000,
+        },
+      } as never, { cwd: `/tmp/${project}` } as never);
+      expect(performance.now() - handlerStarted).toBeLessThan(30_000);
+      if (result && typeof result === "object" && "compaction" in result) break;
+      await Bun.sleep(200);
+    }
     const summary = result && typeof result === "object" && "compaction" in result
       && result.compaction && typeof result.compaction === "object" && "summary" in result.compaction
       ? result.compaction.summary
       : undefined;
     expect(summary).toBeTypeOf("string");
-    expect(performance.now() - started).toBeLessThan(30_000);
-  }, 30_000);
+  }, 70_000);
 }
 
 
@@ -414,7 +496,7 @@ test("compaction accepts a delayed validated response", async () => {
         firstKeptEntryId: "entry-1",
         tokensBefore: 42,
       },
-    } as never, {} as never);
+    } as never, { cwd: process.cwd() } as never);
     vi.advanceTimersByTime(2_100);
     expect(await resultPromise).toMatchObject({ compaction: { summary: "validated" } });
   } finally {
@@ -447,6 +529,32 @@ test("pre-aborted compaction returns native fallback without fetch", async () =>
   }
 });
 
+
+test("missing armed compaction falls through to native", async () => {
+  const { handlers } = extensionStub();
+  const compactHandler = handlers.session_before_compact;
+  expect(compactHandler).toBeTypeOf("function");
+  if (!compactHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("{}", { status: 404 });
+  try {
+    const result = await compactHandler(
+      {
+        signal: new AbortController().signal,
+        preparation: {
+          messagesToSummarize: [{ role: "user", content: "unarmed" }],
+          turnPrefixMessages: [],
+          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+        },
+      } as never,
+      { cwd: process.cwd() } as never,
+    );
+    expect(result).toEqual({});
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("agent end enqueues only newly harvested transcript messages", async () => {
   const { handlers } = extensionStub();
@@ -527,7 +635,7 @@ test("/acm last-compaction reports latest validated result", async () => {
         turnPrefixMessages: [],
         fileOps: { read: new Set(), written: new Set(), edited: new Set() },
       },
-    } as never, {} as never);
+    } as never, { cwd: process.cwd() } as never);
     await command("last-compaction", { ui: { notify: (message: string) => notices.push(message) } } as never);
     expect(notices).toEqual(["ACM last-compaction: score 0.90, ratio 0.20"]);
   } finally {

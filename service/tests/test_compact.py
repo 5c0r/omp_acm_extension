@@ -265,3 +265,126 @@ def test_compaction_carries_mandatory_values_into_summary_before_validation(monk
 
     monkeypatch.setattr(module, "_validation", validate)
     assert module.compact([{"role": "user", "content": "Launch date is April 3; release-lock is required."}], 100)["validation_score"] == 1.0
+
+
+def test_async_compaction_matches_only_its_exact_canonical_input():
+    """Fails if an armed summary is synchronous, unavailable, or reused for different input."""
+    script = """
+import json
+import os
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        prompt = json.loads(self.rfile.read(int(self.headers["Content-Length"])))[ "messages"][-1]["content"]
+        if "TASK: probes" in prompt:
+            content = json.dumps({"probes": [{"question": f"q{index}", "reference_answer": f"a{index}"} for index in range(5)], "must_preserve_verbatim": []})
+        elif "TASK: summary-answers" in prompt:
+            content = json.dumps({"answers": [f"a{index}" for index in range(5)]})
+        elif "TASK: judge" in prompt:
+            content = json.dumps({"verdicts": ["correct"] * 5})
+        else:
+            content = json.dumps({"summary": "validated armed summary"})
+        body = json.dumps({"message": {"content": content}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+os.environ["ACM_OLLAMA_URL"] = f"http://127.0.0.1:{server.server_port}"
+
+from fastapi.testclient import TestClient
+from acm.api import app
+
+scope = f"project:armed-{uuid.uuid4().hex}"
+payload = {
+    "scope": scope,
+    "conversation": [{"role": "user", "content": "Keep a0 a1 a2 a3 a4."}],
+    "turn_prefix": None,
+    "previous_summary": "previous",
+    "custom_instructions": "preserve facts",
+    "file_ops": {"read": ["a.ts"], "written": [], "edited": []},
+    "budget_tokens": 100,
+    "async": True,
+    "from_extension": True,
+}
+with TestClient(app) as client:
+    armed = client.post("/compact", json=payload)
+    assert armed.status_code == 202, armed.text
+    assert set(armed.json()) == {"id"}
+    match_payload = {key: value for key, value in payload.items() if key not in {"async", "from_extension"}}
+    for _ in range(100):
+        hit = client.post("/compact/match", json=match_payload)
+        if hit.status_code == 200:
+            break
+        assert hit.status_code == 404, hit.text
+        time.sleep(0.02)
+    result = hit.json()
+    assert result["summary"].startswith("validated armed summary")
+    assert result["validation_score"] >= 0.8
+    assert result["from_extension"] is True
+    mismatch = dict(match_payload, conversation=[{"role": "user", "content": "Different fact."}])
+    assert client.post("/compact/match", json=mismatch).status_code == 404
+server.shutdown()
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_armed_compaction_serializes_background_jobs(monkeypatch):
+    from acm import compact as module
+    from acm import db
+    import threading
+    import time
+    import uuid
+
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+
+    def fake_compact(*args):
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        with db.connect() as conn:
+            conn.execute("UPDATE compaction SET status = 'done' WHERE id = %s", (args[9],))
+        return {"summary": "done", "validation_score": 1.0, "compression_ratio": 0.1, "probes": []}
+
+    monkeypatch.setattr(module, "compact", fake_compact)
+    scope = f"project:serial-{uuid.uuid4().hex}"
+    first = module.arm_compaction(scope, [{"role": "user", "content": "first"}], 100)
+    second = module.arm_compaction(scope, [{"role": "user", "content": "second"}], 100)
+    for _ in range(100):
+        with db.connect() as conn:
+            states = conn.execute("SELECT status FROM compaction WHERE id IN (%s, %s)", (first, second)).fetchall()
+        if len(states) == 2 and all(row["status"] == "done" for row in states):
+            break
+        time.sleep(0.02)
+    assert all(row["status"] == "done" for row in states)
+    assert peak_active == 1
+
+
+def test_compaction_digest_is_exact_but_file_order_independent():
+    from acm.compact import compaction_digest
+
+    conversation = [{"role": "user", "content": "Keep 2026-05-01 ledger evidence."}]
+    first = compaction_digest(conversation, file_ops={"written": ["b.ts", "a.ts"], "read": ["z.ts"]})
+    reordered = compaction_digest(conversation, file_ops={"read": ["z.ts"], "written": ["a.ts", "b.ts"]})
+    changed = compaction_digest(conversation, file_ops={"read": ["z.ts"], "written": ["a.ts", "c.ts"]})
+
+    assert first == reordered
+    assert first != changed

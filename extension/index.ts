@@ -43,6 +43,35 @@ function fileOps(value: unknown): { read: string[]; written: string[]; edited: s
   };
   return { read: paths("read"), written: paths("written"), edited: paths("edited") };
 }
+
+function branchSnapshot(entries: readonly unknown[]) {
+  let start = 0;
+  let previous_summary: string | null = null;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (
+      typeof entry === "object"
+      && entry !== null
+      && "type" in entry
+      && entry.type === "compaction"
+    ) {
+      start = index + 1;
+      previous_summary = "summary" in entry && typeof entry.summary === "string" ? entry.summary : null;
+      break;
+    }
+  }
+  const rawMessages = entries.slice(start).flatMap(entry => {
+    if (
+      typeof entry !== "object"
+      || entry === null
+      || !("type" in entry)
+      || entry.type !== "message"
+      || !("message" in entry)
+    ) return [];
+    return [entry.message];
+  });
+  return { conversation: messages(rawMessages), previous_summary };
+}
 function acmPreserveData(previous: Record<string, unknown> | undefined, response: CompactResponse) {
   const preserved = Object.fromEntries(
     Object.entries(previous ?? {}).filter(([key]) => key !== "openaiRemoteCompaction" && key !== "snapcompact"),
@@ -234,16 +263,16 @@ export default function acmExtension(pi: ExtensionAPI) {
   });
 
 
-  pi.on("session_before_compact", async (event, _ctx) => {
+  pi.on("session_before_compact", async (event, ctx) => {
     if (event.signal.aborted) return {};
     const preparation = event.preparation;
-    const response = await acmRequest<CompactResponse>("/compact", "POST", {
+    const response = await acmRequest<CompactResponse>("/compact/match", "POST", {
+      scope: projectScope(ctx.cwd),
       conversation: messages(preparation.messagesToSummarize),
-      turn_prefix: preparation.turnPrefixMessages.length ? messages(preparation.turnPrefixMessages) : undefined,
-      previous_summary: preparation.previousSummary,
-      custom_instructions: event.customInstructions,
+      turn_prefix: preparation.turnPrefixMessages.length ? messages(preparation.turnPrefixMessages) : null,
+      previous_summary: preparation.previousSummary ?? null,
+      custom_instructions: event.customInstructions ?? null,
       file_ops: fileOps(preparation.fileOps),
-
       budget_tokens: 1500,
     }, event.signal);
     if (!response || response.validation_score < 0.8) return {};
@@ -278,6 +307,26 @@ export default function acmExtension(pi: ExtensionAPI) {
           session_id: sessionId,
           scope: projectScope(ctx.cwd),
           trajectory,
+        });
+      },
+      0,
+    );
+    const usage = ctx.getContextUsage();
+    if (!usage || !usage.contextWindow || usage.tokens / usage.contextWindow <= 0.6) return;
+    const snapshot = branchSnapshot(ctx.sessionManager.getBranch());
+    if (!snapshot.conversation.length) return;
+    ctx.setTimeout(
+      async () => {
+        await acmRequest("/compact", "POST", {
+          scope: projectScope(ctx.cwd),
+          conversation: snapshot.conversation,
+          turn_prefix: null,
+          previous_summary: snapshot.previous_summary,
+          file_ops: { read: [], written: [], edited: [] },
+          custom_instructions: null,
+          budget_tokens: 1500,
+          async: true,
+          from_extension: true,
         });
       },
       0,

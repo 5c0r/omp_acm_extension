@@ -1,7 +1,10 @@
 """Validated compaction and maintenance consolidation."""
+import hashlib
 import json
-import re
 import os
+import queue
+import re
+import threading
 from typing import Any
 
 from . import db
@@ -13,11 +16,44 @@ from .retrieve import scope_id
 VALIDATION_THRESHOLD = 0.80
 COMPACT_MAX_OUTPUT = int(os.environ.get("ACM_COMPACT_MAX_OUTPUT", "2048"))
 
+_armed_jobs: queue.Queue[tuple[Any, ...]] = queue.Queue()
+_armed_worker: threading.Thread | None = None
+_armed_worker_lock = threading.Lock()
+
 
 
 def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
+
+def _canonical_messages(messages: list[dict[str, Any]] | None) -> list[list[Any]] | None:
+    if messages is None:
+        return None
+    return [[message.get("role"), message.get("content")] for message in messages]
+
+
+def _canonical_file_ops(file_ops: dict[str, list[str]] | None) -> dict[str, list[str]] | None:
+    if file_ops is None:
+        return None
+    return {key: sorted(value) for key, value in sorted(file_ops.items())}
+
+
+def compaction_digest(
+    conversation: list[dict[str, Any]],
+    turn_prefix: list[dict[str, Any]] | None = None,
+    previous_summary: str | None = None,
+    file_ops: dict[str, list[str]] | None = None,
+    custom_instructions: str | None = None,
+) -> str:
+    payload = {
+        "conversation": _canonical_messages(conversation),
+        "turn_prefix": _canonical_messages(turn_prefix),
+        "previous_summary": previous_summary,
+        "file_ops": _canonical_file_ops(file_ops),
+        "custom_instructions": custom_instructions,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 def _files(file_ops: dict[str, list[str]] | None) -> str:
     if not isinstance(file_ops, dict):
@@ -158,6 +194,10 @@ def compact(
     custom_instructions: str | None = None,
     file_ops: dict[str, list[str]] | None = None,
     policy: str | None = None,
+    scope: str | None = None,
+    from_extension: bool = False,
+    compaction_id: int | None = None,
+    digest: str | None = None,
 ) -> dict[str, Any]:
     """Compact complete OMP preparation; opaque preserve data remains host-side."""
     files = _files(file_ops)
@@ -223,14 +263,114 @@ def compact(
     else:
         final_summary = _summary("history", summary_material, attempt_budget, policy) or material[: attempt_budget * 4]
     ratio = tokens(final_summary) / max(1, tokens(full_input))
+    result = {"summary": final_summary, "validation_score": score, "compression_ratio": ratio, "probes": probes}
+    db.ensure_schema()
     with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO compaction (summary, validation_score, compression_ratio) VALUES (%s, %s, %s)",
-            (final_summary, score, ratio),
+        if compaction_id is None:
+            current_scope = scope_id(scope) if scope else None
+            conn.execute(
+                "INSERT INTO compaction (scope_id, summary, validation_score, compression_ratio, digest, status, probes, from_extension) "
+                "VALUES (%s, %s, %s, %s, %s, 'done', %s::jsonb, %s)",
+                (current_scope, final_summary, score, ratio, digest or compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions), json.dumps(probes), from_extension),
+            )
+        else:
+            conn.execute(
+                "UPDATE compaction SET summary = %s, validation_score = %s, compression_ratio = %s, probes = %s::jsonb, status = 'done' "
+                "WHERE id = %s",
+                (final_summary, score, ratio, json.dumps(probes), compaction_id),
+            )
+    return result
+
+
+
+
+def start_compaction_worker() -> None:
+    global _armed_worker
+    with _armed_worker_lock:
+        if _armed_worker and _armed_worker.is_alive():
+            return
+        _armed_worker = threading.Thread(target=_run_armed, name="acm-compact", daemon=True)
+        _armed_worker.start()
+
+
+def _run_armed() -> None:
+    while True:
+        _finish_armed(*_armed_jobs.get())
+
+
+def arm_compaction(
+    scope: str,
+    conversation: list[dict[str, Any]],
+    budget_tokens: int,
+    turn_prefix: list[dict[str, Any]] | None = None,
+    previous_summary: str | None = None,
+    custom_instructions: str | None = None,
+    file_ops: dict[str, list[str]] | None = None,
+    policy: str | None = None,
+    from_extension: bool = False,
+) -> int:
+    db.ensure_schema()
+    digest = compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions)
+    with db.connect() as conn:
+        row = conn.execute(
+            "INSERT INTO compaction (scope_id, summary, validation_score, compression_ratio, digest, status, probes, from_extension) "
+            "VALUES (%s, '', 0, 0, %s, 'in_progress', '[]'::jsonb, %s) RETURNING id",
+            (scope_id(scope), digest, from_extension),
+        ).fetchone()
+    start_compaction_worker()
+    _armed_jobs.put((row["id"], scope, conversation, budget_tokens, turn_prefix, previous_summary, custom_instructions, file_ops, policy, from_extension, digest))
+    return row["id"]
+
+
+def _finish_armed(
+    compaction_id: int,
+    scope: str,
+    conversation: list[dict[str, Any]],
+    budget_tokens: int,
+    turn_prefix: list[dict[str, Any]] | None,
+    previous_summary: str | None,
+    custom_instructions: str | None,
+    file_ops: dict[str, list[str]] | None,
+    policy: str | None,
+    from_extension: bool,
+    digest: str,
+) -> None:
+    try:
+        compact(
+            conversation,
+            budget_tokens,
+            turn_prefix,
+            previous_summary,
+            custom_instructions,
+            file_ops,
+            policy,
+            scope,
+            from_extension,
+            compaction_id,
+            digest,
         )
-    return {"summary": final_summary, "validation_score": score, "compression_ratio": ratio, "probes": probes}
+    except Exception:
+        with db.connect() as conn:
+            conn.execute("UPDATE compaction SET status = 'failed' WHERE id = %s", (compaction_id,))
 
 
+def match_compaction(
+    scope: str,
+    conversation: list[dict[str, Any]],
+    turn_prefix: list[dict[str, Any]] | None = None,
+    previous_summary: str | None = None,
+    custom_instructions: str | None = None,
+    file_ops: dict[str, list[str]] | None = None,
+) -> dict[str, Any] | None:
+    digest = compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions)
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT summary, validation_score, compression_ratio, probes, from_extension FROM compaction "
+            "WHERE scope_id = %s AND digest = %s AND status = 'done' AND validation_score >= %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (scope_id(scope), digest, VALIDATION_THRESHOLD),
+        ).fetchone()
+    return dict(row) if row else None
 def _literal(vector: Any) -> str:
     return vector if isinstance(vector, str) else vector_literal(vector)
 

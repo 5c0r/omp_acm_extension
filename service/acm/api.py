@@ -3,13 +3,13 @@ from contextlib import asynccontextmanager
 import threading
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from . import db
 from .anticipate import anticipate, get_bundle
 from .architect import generate_architecture
-from .compact import compact, consolidate
+from .compact import arm_compaction, compact, consolidate, match_compaction, start_compaction_worker
 from .ingest import start_worker, status as ingest_status, submit
 from .retrieve import fetch, scope_id
 
@@ -18,6 +18,7 @@ from .retrieve import fetch, scope_id
 async def lifespan(_: FastAPI):
     db.ensure_schema()
     start_worker()
+    start_compaction_worker()
     yield
 
 
@@ -50,6 +51,7 @@ class AnticipateRequest(BaseModel):
 
 
 class CompactRequest(BaseModel):
+    scope: str | None = None
     conversation: list[dict[str, Any]]
     budget_tokens: int = Field(ge=1)
     turn_prefix: list[dict[str, Any]] | None = None
@@ -57,7 +59,8 @@ class CompactRequest(BaseModel):
     custom_instructions: str | None = None
     file_ops: dict[str, list[str]] | None = None
     policy: str | None = None
-
+    asynchronous: bool = Field(default=False, alias="async")
+    from_extension: bool = False
 
 class ConsolidateRequest(BaseModel):
     scope: str
@@ -119,7 +122,24 @@ def bundle(session_id: str) -> dict[str, Any]:
 
 
 @app.post("/compact")
-def compact_session(request: CompactRequest) -> dict[str, Any]:
+def compact_session(request: CompactRequest, response: Response) -> dict[str, Any]:
+    if request.asynchronous:
+        if not request.scope:
+            raise HTTPException(status_code=400, detail="scope is required for async compaction")
+        response.status_code = status.HTTP_202_ACCEPTED
+        return {
+            "id": arm_compaction(
+                request.scope,
+                request.conversation,
+                request.budget_tokens,
+                request.turn_prefix,
+                request.previous_summary,
+                request.custom_instructions,
+                request.file_ops,
+                request.policy,
+                request.from_extension,
+            )
+        }
     return compact(
         request.conversation,
         request.budget_tokens,
@@ -128,7 +148,26 @@ def compact_session(request: CompactRequest) -> dict[str, Any]:
         request.custom_instructions,
         request.file_ops,
         request.policy,
+        request.scope,
+        request.from_extension,
     )
+
+
+@app.post("/compact/match")
+def compact_match(request: CompactRequest) -> dict[str, Any]:
+    if not request.scope:
+        raise HTTPException(status_code=400, detail="scope is required for compaction match")
+    result = match_compaction(
+        request.scope,
+        request.conversation,
+        request.turn_prefix,
+        request.previous_summary,
+        request.custom_instructions,
+        request.file_ops,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="matching compaction not found")
+    return result
 
 
 @app.post("/consolidate")

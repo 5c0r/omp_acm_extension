@@ -86,12 +86,21 @@ CREATE INDEX IF NOT EXISTS ingest_job_digest_idx ON ingest_job (scope_id, digest
 CREATE TABLE IF NOT EXISTS compaction (
     id                 serial PRIMARY KEY,
     scope_id           integer REFERENCES scope(id) ON DELETE CASCADE,
-    summary            text NOT NULL,
+    summary            text NOT NULL DEFAULT '',
     validation_score   real NOT NULL,
     compression_ratio  real NOT NULL,
+    digest             text,
+    status             text NOT NULL DEFAULT 'done' CHECK (status IN ('in_progress', 'done', 'failed')),
+    probes             jsonb NOT NULL DEFAULT '[]'::jsonb,
+    from_extension     boolean NOT NULL DEFAULT false,
     created_at         timestamptz NOT NULL DEFAULT now()
 );
-
+ALTER TABLE compaction ADD COLUMN IF NOT EXISTS digest text;
+ALTER TABLE compaction ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'done';
+ALTER TABLE compaction ADD COLUMN IF NOT EXISTS probes jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE compaction ADD COLUMN IF NOT EXISTS from_extension boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS compaction_match_idx ON compaction (scope_id, digest, created_at DESC)
+    WHERE status = 'done' AND validation_score >= 0.8;
 CREATE TABLE IF NOT EXISTS prefetch (
     id              serial PRIMARY KEY,
     scope_id        integer NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
