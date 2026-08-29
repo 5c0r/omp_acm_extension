@@ -1,4 +1,6 @@
 import { expect, test, vi } from "bun:test";
+import { basename } from "node:path";
+
 
 import acmExtension, { shouldAutoArm } from "./index";
 
@@ -12,6 +14,11 @@ type RegisteredCommand = { handler: CommandHandler };
 
 type RegisteredFlag = { name: string; description: string; type?: "boolean" | "string" };
 
+
+function projectScope(): string {
+  const result = Bun.spawnSync(["git", "-C", process.cwd(), "rev-parse", "--show-toplevel"]);
+  return `project:${basename(new TextDecoder().decode(result.stdout).trim()).toLowerCase()}`;
+}
 
 
 function extensionStub(initialFlag?: unknown) {
@@ -67,7 +74,7 @@ test("registers acm-mode flag", () => {
   ]);
 });
 
-test("session start probes health then renders ready status footer", async () => {
+test("session start probes health then renders connected status footer", async () => {
   const previousWidget = process.env.ACM_WIDGET;
   delete process.env.ACM_WIDGET;
   const { handlers } = extensionStub();
@@ -83,7 +90,7 @@ test("session start probes health then renders ready status footer", async () =>
   };
   try {
     await sessionStart({} as never, { hasUI: true, ui: { setStatus } } as never);
-    expect(setStatus).toHaveBeenCalledWith("acm", "ACM full · ready");
+    expect(setStatus).toHaveBeenCalledWith("acm", "ACM full · connected");
   } finally {
     globalThis.fetch = originalFetch;
     if (previousWidget === undefined) delete process.env.ACM_WIDGET;
@@ -161,6 +168,210 @@ test("/acm status reports service health and stats", async () => {
   }
 });
 
+
+test("/acm browse prints scope summary without interactive UI", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  const urls: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 2 } } }));
+  };
+  try {
+    await handler("browse", { hasUI: false, ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(urls).toEqual(["http://localhost:8927/api/ui/dashboard"]);
+    expect(notices).toEqual(["ACM browse (non-interactive):\nproject:browse-live (2)"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("/acm browse passes string-only scope options to native UI", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  let scopeOptions: unknown[] = [];
+  globalThis.fetch = async () => new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 2 } } }));
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async (_title: string, options: unknown[]) => {
+          scopeOptions = options;
+          return undefined;
+        },
+        notify: () => undefined,
+      },
+    } as never);
+    expect(scopeOptions).toEqual(["project:browse-live — 2 memories"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+
+test("/acm browse passes string-only memory and merge options to native UI", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const selectors = new Map<string, unknown[]>();
+  const actions = ["Merge into…", "Done"];
+  globalThis.fetch = async url => {
+    const address = String(url);
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 2 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [
+      { id: 41, kind: "fact", content: "Source memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false },
+      { id: 42, kind: "fact", content: "Target memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false },
+    ] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Source memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+    return new Response(JSON.stringify({ id: 42, kind: "fact", content: "Target memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async (title: string, options: unknown[]) => {
+          selectors.set(title, options);
+          if (title === "ACM browse — scope") return "project:browse-live — 2 memories";
+          if (title === "ACM browse — memory") return "#41 [fact] Source memory — active";
+          if (title === "ACM memory actions") return actions.shift();
+          return "#42 [fact] Target memory — active";
+        },
+        confirm: async () => true,
+        notify: () => undefined,
+      },
+    } as never);
+    expect(selectors.get("ACM browse — memory")).toEqual(["#41 [fact] Source memory — active", "#42 [fact] Target memory — active"]);
+    expect(selectors.get("Merge into")).toEqual(["#42 [fact] Target memory — active"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/acm browse edits selected memory through native dialogs", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
+  const selections = ["project:browse-live — 1 memories", "#41 [fact] Widget API key rotates weekly — active", "Edit", "Done"];
+  const editor = vi.fn(async () => "Widget API key rotates monthly");
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+    return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates monthly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async () => selections.shift(),
+        editor,
+        notify: () => undefined,
+      },
+    } as never);
+    expect(editor).toHaveBeenCalledWith("Edit ACM memory #41", "Widget API key rotates weekly");
+    expect(requests).toContainEqual({
+      url: "http://localhost:8927/memories/41",
+      method: "PATCH",
+      body: { content: "Widget API key rotates monthly" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("/acm browse retains linked entities after a memory mutation", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
+  const selections = ["project:browse-live — 1 memories", "#41 [fact] Widget API key rotates weekly — active", "Pin", "Add alias", "#9 widget", "Done"];
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [{ id: 9, canonical_name: "widget" }] }));
+    return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: true }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async () => selections.shift(),
+        input: async () => "widget-live",
+        notify: () => undefined,
+      },
+    } as never);
+    expect(requests).toContainEqual({
+      url: "http://localhost:8927/entities/9/aliases",
+      method: "POST",
+      body: { alias: "widget-live" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/acm browse removes a selected entity alias", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
+  const selections = ["project:browse-live — 1 memories", "#41 [fact] Widget API key rotates weekly — active", "Remove alias", "#9 widget", "widget-live", "Done"];
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [{ id: 9, canonical_name: "widget", aliases: ["widget-live"] }] }));
+    return new Response(JSON.stringify({ id: 9, canonical_name: "widget", aliases: [] }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async () => selections.shift(),
+        input: async () => undefined,
+        notify: () => undefined,
+      },
+    } as never);
+    expect(requests).toContainEqual({
+      url: "http://localhost:8927/entities/9/aliases",
+      method: "DELETE",
+      body: { alias: "widget-live" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("/acm selfcheck exercises every ACM endpoint", async () => {
   const { commandHandlers } = extensionStub();
   const handler = commandHandlers.acm;
@@ -205,6 +416,8 @@ test("/acm selfcheck exercises every ACM endpoint", async () => {
       "project:acm-selfcheck-session-5",
     ]);
     expect(requests.find(request => request.url.endsWith("/compact"))?.body?.scope).toBe("project:acm-selfcheck-session-5");
+    expect(requests.find(request => request.url.endsWith("/fetch"))?.body?.session_id).toBe("session-5");
+    expect(requests.find(request => request.url.endsWith("/compact"))?.body?.session_id).toBe("session-5");
     expect(requests.find(request => request.url.endsWith("/anticipate"))?.body?.session_id).toBe("acm-selfcheck-session-5");
     expect(notices).toEqual([[
       "ACM selfcheck",
@@ -289,7 +502,7 @@ test("tools route scoped requests to ACM endpoints", async () => {
     await invoke("acm_status", { job_id: 7 });
     await invoke("acm_consolidate", { scope: "project:shared" });
     expect(requests).toEqual([
-      { url: "http://localhost:8927/fetch", body: { query: "billing", scope: "project:acm-tools", budget_tokens: 600, deep: true } },
+      { url: "http://localhost:8927/fetch", body: { query: "billing", scope: "project:acm-tools", budget_tokens: 600, deep: true, session_id: "session-3" } },
       { url: "http://localhost:8927/ingest", body: { scope: "project:shared", text: "retain this", source_ref: "note-1" } },
       { url: "http://localhost:8927/compact", body: {
         scope: "project:acm-tools",
@@ -297,6 +510,7 @@ test("tools route scoped requests to ACM endpoints", async () => {
         budget_tokens: 100,
         file_ops: { read: ["src/a.ts"], written: [], edited: ["src/a.ts"] },
         custom_instructions: "retain rollout details",
+        session_id: "session-3",
       } },
       { url: "http://localhost:8927/architect", body: { scope: "project:acm-tools", description: "billing memory", reference: "ADR-1" } },
       { url: "http://localhost:8927/status/7", body: undefined },
@@ -455,7 +669,7 @@ test("armed compaction match keeps unrelated preserve data but discards stale pa
       {
         url: "http://localhost:8927/compact/match",
         body: {
-          scope: "project:feat-acm-omp-extension",
+          scope: projectScope(),
           conversation: [{ role: "user", content: "history" }],
           turn_prefix: [{ role: "assistant", content: "split turn" }],
           previous_summary: "earlier",
@@ -926,7 +1140,7 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
     expect(requests[0]).toMatchObject({
       url: "http://localhost:8927/ingest",
       body: {
-        scope: "project:feat-acm-omp-extension",
+        scope: projectScope(),
         source_ref: "session:session-2",
         text: "user: Use Pro billing.\nassistant: I will retain billing scope.\nassistant: Existing billing record is stable.",
       },
@@ -943,6 +1157,59 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
       "acm",
       "ACM full · bundle ✓0 ✗0 · ingest 5 · last compact —",
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
+test("agent end harvests only text blocks and caps the ingest payload", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { handlers } = extensionStub();
+  const agentEnd = handlers.agent_end;
+  expect(agentEnd).toBeTypeOf("function");
+  if (!agentEnd) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ body: Record<string, unknown> }> = [];
+  const timers: Array<() => Promise<void>> = [];
+  globalThis.fetch = async (_url, init) => {
+    requests.push({ body: JSON.parse(String(init?.body)) });
+    return new Response(JSON.stringify({ job_id: 1 }), { status: 200 });
+  };
+  try {
+    await agentEnd(
+      {
+        messages: [
+          { role: "assistant", content: [
+            { type: "thinking", thinking: "private-reasoning" },
+            { type: "tool_use", name: "write", input: { path: "secret" } },
+            { type: "text", text: "Durable response." },
+            { type: "tool_result", content: "private-result" },
+          ] },
+          { role: "user", content: [{ type: "tool_result", content: "ignore this" }] },
+          { role: "user", content: [{ type: "text", text: "x".repeat(30_000) }] },
+        ],
+      } as never,
+      {
+        cwd: process.cwd(),
+        hasUI: true,
+        sessionManager: { getSessionId: () => "filtered-harvest" },
+        setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+        ui: { setStatus: () => undefined },
+      } as never,
+    );
+    await timers[0]?.();
+    const text = String(requests[0]?.body.text);
+    expect(text).toContain("assistant: Durable response.");
+    expect(text).not.toContain("thinking");
+    expect(text).not.toContain("tool_use");
+    expect(text).not.toContain("tool_result");
+    expect(text).not.toContain("private-reasoning");
+    expect(text).not.toContain("private-result");
+    expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(24 * 1024);
   } finally {
     globalThis.fetch = originalFetch;
     if (previousWidget === undefined) delete process.env.ACM_WIDGET;

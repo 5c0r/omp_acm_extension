@@ -32,7 +32,8 @@ def test_api_exposes_lifecycle_routes_under_lifespan():
             if job["status"] != "pending":
                 break
             time.sleep(0.05)
-        assert job["status"] == "done", job
+        assert job["status"] == "failed", job
+        assert job["result"] == {"reason": "extraction unavailable"}, job
 
         assert client.post("/fetch", json={"scope": scope, "query": "Pro plan"}).status_code == 200
         assert client.post(

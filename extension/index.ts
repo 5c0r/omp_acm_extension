@@ -18,21 +18,52 @@ type CompactResponse = {
   probes: Probe[];
 };
 
+type BrowseMemory = {
+  id: number;
+  kind: string;
+  content: string;
+  scope: string;
+  status: string;
+  importance: number;
+  pinned: boolean;
+  entities?: Array<{ id: number; canonical_name: string; aliases?: string[] }>;
+};
+
+const MAX_HARVEST_BYTES = 24 * 1024;
+
+function textContent(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return undefined;
+  const text = value.flatMap(block => {
+    if (typeof block !== "object" || block === null) return [];
+    const item = block as { type?: unknown; text?: unknown };
+    return item.type === "text" && typeof item.text === "string" ? [item.text] : [];
+  }).join("\n");
+  return text.trim() ? text : undefined;
+}
+
 function messages(messages: readonly unknown[]): MessagePayload[] {
-  return messages.map(message => {
-    if (typeof message === "object" && message !== null) {
-      const value = message as { role?: unknown; content?: unknown; summary?: unknown };
-      const role = typeof value.role === "string" ? value.role : "unknown";
-      const isCompactionSummary = role === "compactionSummary";
-      const content = typeof value.content === "string"
-        ? value.content
-        : isCompactionSummary && typeof value.summary === "string"
-          ? value.summary
-          : JSON.stringify(value.content) ?? "";
-      return { role: isCompactionSummary ? "assistant" : role, content };
-    }
-    return { role: "unknown", content: String(message) };
+  return messages.flatMap(message => {
+    if (typeof message !== "object" || message === null) return [];
+    const value = message as { role?: unknown; content?: unknown; summary?: unknown };
+    const role = typeof value.role === "string" ? value.role : "unknown";
+    const content = role === "compactionSummary" && typeof value.summary === "string"
+      ? value.summary
+      : textContent(value.content);
+    return content?.trim() ? [{ role: role === "compactionSummary" ? "assistant" : role, content }] : [];
   });
+}
+
+function capHarvestText(text: string): string {
+  let bytes = 0;
+  for (let index = 0; index < text.length;) {
+    const codePoint = text.codePointAt(index)!;
+    const width = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (bytes + width > MAX_HARVEST_BYTES) return text.slice(0, index);
+    bytes += width;
+    index += codePoint > 0xffff ? 2 : 1;
+  }
+  return text;
 }
 
 function fileOps(value: unknown): { read: string[]; written: string[]; edited: string[] } {
@@ -177,7 +208,7 @@ export default function acmExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!statusLineEnabled || !ctx.hasUI) return;
     serviceOnline = (await acmRequest("/health")) !== null;
-    setStatusBar(ctx, `ACM ${getMode().mode} · ${serviceOnline ? "ready" : "offline"}`);
+    setStatusBar(ctx, `ACM ${getMode().mode} · ${serviceOnline ? "connected" : "offline"}`);
   });
   const z = pi.zod;
 
@@ -192,6 +223,7 @@ export default function acmExtension(pi: ExtensionAPI) {
         scope: projectScope(ctx.cwd),
         budget_tokens: params.budget_tokens ?? 1500,
         deep: params.deep ?? false,
+        session_id: ctx.sessionManager.getSessionId(),
       }, signal));
     },
   });
@@ -227,6 +259,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     async execute(_id, params, signal, _onUpdate, ctx) {
       const response = await acmRequest<CompactResponse>("/compact", "POST", {
         scope: projectScope(ctx.cwd),
+        session_id: ctx.sessionManager.getSessionId(),
         conversation: [{ role: "user", content: params.conversation }],
         budget_tokens: params.budget_tokens ?? 1500,
         previous_summary: params.previous_summary,
@@ -275,7 +308,7 @@ export default function acmExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("acm", {
-    description: "ACM status, selfcheck, inject, or last-compaction.",
+    description: "ACM status, browse, selfcheck, inject, or last-compaction.",
     handler: async (args, ctx) => {
       const [command, value] = String(args).trim().split(/\s+/, 2);
       if (command === "status") {
@@ -287,6 +320,115 @@ export default function acmExtension(pi: ExtensionAPI) {
         const values = stats?.stats ?? {};
         ctx.ui.notify(`ACM status: ${health?.status ?? "unavailable"}; mode=${mode.mode}; bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}; session ✓${bundleHits} ✗${bundleMisses}; ingest ${ingestCount}`, "info");
         return;
+      }
+      if (command === "browse") {
+        const dashboard = await acmRequest<{ totals?: { scope?: Record<string, number> } }>("/api/ui/dashboard");
+        const scopes = Object.entries(dashboard?.totals?.scope ?? {}).sort(([left], [right]) => left.localeCompare(right));
+        if (!scopes.length) {
+          ctx.ui.notify("ACM browse: no memories.", "info");
+          return;
+        }
+        if (!ctx.hasUI) {
+          ctx.ui.notify(`ACM browse (non-interactive):\n${scopes.map(([scope, count]) => `${scope} (${count})`).join("\n")}`, "info");
+          return;
+        }
+        const scopeChoices = scopes.map(([scope, count]) => `${scope} — ${count} memories`);
+        const selectedScope = await ctx.ui.select("ACM browse — scope", scopeChoices);
+        const scope = scopes.find(([candidate, count]) => `${candidate} — ${count} memories` === selectedScope)?.[0];
+        if (!scope) return;
+        const listed = await acmRequest<{ items?: BrowseMemory[] }>(`/api/ui/memories?scope=${encodeURIComponent(scope)}&limit=100`);
+        const memories = listed?.items ?? [];
+        if (!memories.length) {
+          ctx.ui.notify(`ACM browse: no memories in ${scope}.`, "info");
+          return;
+        }
+        const choices = memories.map(memory => ({
+          memory,
+          label: `#${memory.id} [${memory.kind}] ${memory.content.slice(0, 72)} — ${memory.status}`,
+        }));
+        const selectedLabel = await ctx.ui.select("ACM browse — memory", choices.map(choice => choice.label));
+        const selected = choices.find(choice => choice.label === selectedLabel)?.memory;
+        if (!selected) return;
+        let current = (await acmRequest<BrowseMemory>(`/api/ui/memories/${selected.id}`)) ?? selected;
+        const refresh = async (memory: BrowseMemory) => (await acmRequest<BrowseMemory>(`/api/ui/memories/${memory.id}`)) ?? memory;
+
+        for (;;) {
+          ctx.ui.notify(`ACM memory #${current.id} [${current.kind}] ${current.status}${current.pinned ? " · pinned" : ""}\n${current.content}`, "info");
+          const action = await ctx.ui.select("ACM memory actions", [
+            "Edit",
+            current.status === "active" ? "Archive" : "Restore",
+            current.pinned ? "Unpin" : "Pin",
+            "Set importance",
+            "Merge into…",
+            "Add alias",
+            ...(current.entities?.some(entity => entity.aliases?.length) ? ["Remove alias"] : []),
+            "Done",
+          ]);
+          if (!action || action === "Done") return;
+
+          if (action === "Edit") {
+            const content = await ctx.ui.editor(`Edit ACM memory #${current.id}`, current.content);
+            if (!content?.trim()) continue;
+            const updated = await acmRequest<BrowseMemory>(`/memories/${current.id}`, "PATCH", { content });
+            if (!updated) ctx.ui.notify("ACM browse: edit failed.", "error");
+            else current = await refresh(updated);
+            continue;
+          }
+          if (action === "Archive" || action === "Restore") {
+            const verb = action.toLowerCase();
+            if (!await ctx.ui.confirm(`${action} ACM memory`, `${action} memory #${current.id}?`)) continue;
+            const updated = await acmRequest<BrowseMemory>(`/memories/${current.id}/${verb}`, "POST");
+            if (!updated) ctx.ui.notify(`ACM browse: ${verb} failed.`, "error");
+            else current = await refresh(updated);
+            continue;
+          }
+          if (action === "Pin" || action === "Unpin") {
+            const updated = await acmRequest<BrowseMemory>(`/memories/${current.id}`, "PATCH", { pinned: action === "Pin" });
+            if (!updated) ctx.ui.notify("ACM browse: pin update failed.", "error");
+            else current = await refresh(updated);
+            continue;
+          }
+          if (action === "Set importance") {
+            const value = await ctx.ui.input("ACM importance (0–1)", String(current.importance));
+            const importance = Number(value);
+            if (!Number.isFinite(importance) || importance < 0 || importance > 1) {
+              ctx.ui.notify("ACM browse: importance must be 0–1.", "error");
+              continue;
+            }
+            const updated = await acmRequest<BrowseMemory>(`/memories/${current.id}`, "PATCH", { importance });
+            if (!updated) ctx.ui.notify("ACM browse: importance update failed.", "error");
+            else current = await refresh(updated);
+            continue;
+          }
+          if (action === "Merge into…") {
+            const targets = choices.filter(choice => choice.memory.id !== current.id && choice.memory.status === "active");
+            const targetLabel = await ctx.ui.select("Merge into", targets.map(choice => choice.label));
+            const target = targets.find(choice => choice.label === targetLabel)?.memory;
+            if (!target || !await ctx.ui.confirm("Merge ACM memory", `Merge #${current.id} into #${target.id}? Source becomes archived.`)) continue;
+            const updated = await acmRequest<BrowseMemory>(`/memories/${current.id}/merge`, "POST", { target_id: target.id });
+            if (!updated) ctx.ui.notify("ACM browse: merge failed.", "error");
+            else current = await refresh(updated);
+            continue;
+          }
+          const entities = current.entities ?? [];
+          if (!entities.length) {
+            ctx.ui.notify("ACM browse: no linked entities.", "info");
+            continue;
+          }
+          const entityLabel = await ctx.ui.select(
+            action === "Remove alias" ? "Remove alias from entity" : "Add alias to entity",
+            entities.map(entity => `#${entity.id} ${entity.canonical_name}`),
+          );
+          const entity = entities.find(candidate => `#${candidate.id} ${candidate.canonical_name}` === entityLabel);
+          if (!entity) continue;
+          if (action === "Remove alias") {
+            const alias = await ctx.ui.select(`Remove alias from ${entity.canonical_name}`, entity.aliases ?? []);
+            if (alias && await acmRequest(`/entities/${entity.id}/aliases`, "DELETE", { alias })) current = await refresh(current);
+            continue;
+          }
+          const alias = await ctx.ui.input(`Alias for ${entity.canonical_name}`);
+          if (alias?.trim() && await acmRequest(`/entities/${entity.id}/aliases`, "POST", { alias })) current = await refresh(current);
+        }
       }
       if (command === "selfcheck") {
         const sessionId = ctx.sessionManager.getSessionId();
@@ -301,7 +443,7 @@ export default function acmExtension(pi: ExtensionAPI) {
         });
         const jobId = typeof ingest?.job_id === "number" ? ingest.job_id : 0;
         const status = await acmRequest(`/status/${jobId}`);
-        const fetch = await acmRequest("/fetch", "POST", { query: "ACM selfcheck", scope, budget_tokens: 1, deep: false });
+        const fetch = await acmRequest("/fetch", "POST", { query: "ACM selfcheck", scope, budget_tokens: 1, deep: false, session_id: sessionId });
         const anticipate = await acmRequest("/anticipate", "POST", {
           session_id: selfcheckSessionId,
           scope,
@@ -314,6 +456,7 @@ export default function acmExtension(pi: ExtensionAPI) {
         }
         const compact = await acmRequest("/compact", "POST", {
           scope,
+          session_id: sessionId,
           conversation: [{ role: "user", content: "ACM selfcheck" }],
           budget_tokens: 1,
         });
@@ -415,7 +558,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     });
     if (!additions.length) return;
     harvested.set(sessionId, seen);
-    const transcript = additions.map(message => `${message.role}: ${message.content}`).join("\n");
+    const transcript = capHarvestText(additions.map(message => `${message.role}: ${message.content}`).join("\n"));
     ctx.setTimeout(
       async () => {
         const result = await acmRequest<{ job_id?: unknown }>("/ingest", "POST", {

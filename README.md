@@ -32,7 +32,7 @@ ACM adds per-agent generated memory architecture, anticipatory retrieval (trajec
 
 ACM has three modes: `full` (default), `memory` (ACM memory only with native compaction), and `compaction` (ACM compaction only, coexisting with Hindsight/Mnemopi as `memory.backend`). Configure with `--acm-mode` or `ACM_MODE`.
 
-Interactive sessions show status below editor: mode, bundle hits/misses, harvested count, and latest compaction score. At session start, ACM probes health then renders `ACM <mode> · ready` or `offline`.
+Interactive sessions show status below editor: mode, bundle hits/misses, harvested count, and latest compaction score. At session start, ACM probes health then renders `ACM <mode> · connected` or `offline`.
 
 ### Honest limitations
 
@@ -42,6 +42,7 @@ Interactive sessions show status below editor: mode, bundle hits/misses, harvest
 | Anticipation | Best-effort async cache; a missing/expired bundle injects nothing. | Need guaranteed recall -> use explicit `acm_fetch`. |
 | Compaction | Automatic validated compaction is off (`ACM_AUTO_ARM=0`): public `turn_end` lacks native preparation's dynamic cut point, turn prefix, and file ops. Hook only reads an exact canonical-digest match; any miss falls through native. | Live OMP proves an automatic threshold compaction matches an armed digest -> enable arming; otherwise use explicit `acm_compact`. |
 | Selfcheck | Intentionally writes only synthetic scope/bundle; may wait up to about one minute for async bundle. | Need non-mutating probe -> add service-owned health/readiness route. |
+| Schema init | Each service process holds a Postgres advisory lock while reapplying additive `IF NOT EXISTS` DDL; no migration history or destructive DDL. | Startup contention or a non-additive migration -> introduce a versioned migration runner. |
 
 ## Install
 
@@ -51,9 +52,13 @@ Interactive sessions show status below editor: mode, bundle hits/misses, harvest
 - Docker
 - Ollama, with `qwen3:4b` and `qwen3-embedding:0.6b` (1024 dimensions) reachable on port `11434`, from a native install or container
 
-Clone this repository, then start local dependencies and ACM:
+Clone this repository, pull required Ollama models, then start local dependencies and ACM:
 
 ```bash
+git clone https://github.com/5c0r/omp_acm_extension.git
+cd omp_acm_extension
+ollama pull qwen3:4b
+ollama pull qwen3-embedding:0.6b
 docker compose -p acm up -d --build
 ```
 
@@ -62,23 +67,42 @@ The service listens on `127.0.0.1:8927`; Postgres listens on `127.0.0.1:5433`.
 Link the extension:
 
 ```bash
-ln -s <repo>/extension ~/.omp/agent/extensions/acm
+ln -s "$(pwd)/extension" "$HOME/.omp/agent/extensions/acm"
 ```
 
-Start a fresh `omp` session. Footer should show `ACM <mode> · ready`; run `/acm selfcheck` until every row is `PASS`, then run `/acm status`.
+Start a fresh `omp` session. Footer should show `ACM <mode> · connected`; run `/acm selfcheck` until every row is `PASS`, then run `/acm status`.
+
+### Memory UI
+
+Open [http://127.0.0.1:8927/ui/](http://127.0.0.1:8927/ui/) for local memory operations. Dashboard is default: counts by kind/status/scope, bundle hit/miss, ingest outcomes, compaction validation history, and top-used memories. Browse filters by exact scope, kind, status, and text; a memory detail shows content, importance, temporal validity, provenance, entities, and its usage drill-down.
+
+Detail actions edit content, archive/restore, merge into a same-scope memory, pin/unpin, set importance, and add/remove entity aliases. Archive is recoverable: ACM has no hard-delete UI action.
+
+`/acm browse` provides same flow in OMP: select scope, select memory, inspect detail, then manage it through native dialogs. Non-interactive OMP sessions print scope summary only.
+
+For a repeatable local roundtrip, seed the browse demo once or repeatedly:
+
+```bash
+curl -X POST http://127.0.0.1:8927/api/ui/seed-demo
+```
+
+It idempotently creates `project:browse-live` memory containing `Widget API key rotates weekly`.
 
 ### Runbook
 
 ```bash
-# Service lifecycle proof.
-docker compose -p acm run --rm --no-deps \
-  -v "$PWD/service/tests:/app/tests:ro" \
-  -e ACM_TEST_BASE_URL=http://acm-service:8927 \
-  acm-service pytest tests/test_lifecycle.py -q
+# Full service suite. Runtime image has no tests; mount them only into disposable `acm-test`.
+test_compose=(docker compose -p acm-test -f docker-compose.yml -f docker-compose.test.yml)
+"${test_compose[@]}" up -d --build
+"${test_compose[@]}" run --rm --no-deps acm-service sh -ec 'test ! -e /app/tests'
+"${test_compose[@]}" run --rm --no-deps -v "$PWD/service/tests:/app/tests:ro" \
+  -e ACM_TEST_BASE_URL=http://acm-service:8927 acm-service pytest tests/ -q
+status=$?
+"${test_compose[@]}" down -v
+exit "$status"
 
-# Extension tests; second command invokes local ACM for real deadline proof.
-(cd extension && bun test extension.test.ts)
-(cd extension && ACM_LIVE_TEST=1 bun test extension.test.ts)
+# Extension unit/mocked tests.
+(cd extension && bun test)
 ```
 
 `/acm status` reports active mode, health, service stats, and session bundle/ingest counters. `/acm selfcheck` uses its own `project:acm-selfcheck-<session>` scope and `acm-selfcheck-<session>` bundle key, then prints endpoint pass/fail rows. `/acm inject on|off` toggles bundle injection for current runtime. `/acm last-compaction` shows latest validated hook result.
@@ -97,7 +121,7 @@ Select a preset at OMP startup with `omp --acm-mode=<mode>` or `ACM_MODE=<mode> 
 
 | Environment | Default | Effect |
 |---|---|---|
-| `ACM_WIDGET` | on | Set `0` to disable ACM footer status line (env name kept for compatibility). Session start probes health then renders `ACM <mode> · ready` or `offline`; activity counts advance only after verified ACM responses. |
+| `ACM_WIDGET` | on | Set `0` to disable ACM footer status line (env name kept for compatibility). Session start probes health then renders `ACM <mode> · connected` or `offline`; activity counts advance only after verified ACM responses. |
 
 OMP extensions cannot read arbitrary `config.yml` keys; use flag or env until OMP core exposes extension settings. `compaction` leaves memory ownership to Hindsight/Mnemopi; no Hindsight-to-ACM bridge exists.
 

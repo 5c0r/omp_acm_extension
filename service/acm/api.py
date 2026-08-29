@@ -1,9 +1,11 @@
 """FastAPI boundary for ACM lifecycle primitives."""
 from contextlib import asynccontextmanager
+from pathlib import Path
 import threading
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response, status
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
@@ -12,6 +14,7 @@ from .architect import generate_architecture
 from .compact import arm_compaction, compact, consolidate, match_compaction, start_compaction_worker
 from .ingest import start_worker, status as ingest_status, submit
 from .retrieve import fetch, scope_id
+from .ui import manage_router, ui_router
 
 
 @asynccontextmanager
@@ -23,6 +26,10 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="ACM service", lifespan=lifespan)
+app.include_router(manage_router)
+app.include_router(ui_router)
+app.mount("/ui", StaticFiles(directory=Path(__file__).with_name("web"), html=True), name="ui")
+
 
 
 class ArchitectRequest(BaseModel):
@@ -42,6 +49,7 @@ class FetchRequest(BaseModel):
     scope: str
     budget_tokens: int = Field(default=1500, ge=0)
     deep: bool = False
+    session_id: str | None = None
 
 
 class AnticipateRequest(BaseModel):
@@ -56,6 +64,7 @@ class CompactRequest(BaseModel):
     budget_tokens: int = Field(ge=1)
     turn_prefix: list[dict[str, Any]] | None = None
     previous_summary: str | None = None
+    session_id: str | None = None
     custom_instructions: str | None = None
     file_ops: dict[str, list[str]] | None = None
     policy: str | None = None
@@ -98,7 +107,7 @@ def job_status(job_id: int) -> dict[str, Any]:
 @app.post("/fetch")
 def fetch_memories(request: FetchRequest) -> dict[str, list[dict[str, Any]]]:
     try:
-        return fetch(request.query, request.scope, request.budget_tokens, request.deep)
+        return fetch(request.query, request.scope, request.budget_tokens, request.deep, session_id=request.session_id)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
 
@@ -138,6 +147,7 @@ def compact_session(request: CompactRequest, response: Response) -> dict[str, An
                 request.file_ops,
                 request.policy,
                 request.from_extension,
+                request.session_id,
             )
         }
     return compact(
@@ -150,6 +160,7 @@ def compact_session(request: CompactRequest, response: Response) -> dict[str, An
         request.policy,
         request.scope,
         request.from_extension,
+        session_id=request.session_id,
     )
 
 

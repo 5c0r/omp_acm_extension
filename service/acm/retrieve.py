@@ -9,6 +9,7 @@ from . import db
 from .entities import vector_literal
 from .llm import chat_json, embed, tokens
 from .sanitize import sanitize
+from .usage import log_usage
 
 
 RRF_K = int(os.environ.get("ACM_RRF_K", "60"))
@@ -106,7 +107,12 @@ def _rerank(query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def fetch(
-    query: str, scope: str, budget_tokens: int = 1500, deep: bool = False, record_stat: bool = True
+    query: str,
+    scope: str,
+    budget_tokens: int = 1500,
+    deep: bool = False,
+    record_stat: bool = True,
+    session_id: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Return provenance-tagged explicit retrieval; no anticipation cache is consulted."""
     if not query.strip():
@@ -146,4 +152,5 @@ def fetch(
         items.append(item)
     if record_stat:
         db.bump_stat("explicit_fetch")
+        log_usage((item["id"] for item in items), "fetch", session_id=session_id, scope=scope)
     return {"items": items}
