@@ -1,4 +1,6 @@
 import { expect, test, vi } from "bun:test";
+import { basename } from "node:path";
+
 
 import acmExtension, { shouldAutoArm } from "./index";
 
@@ -12,6 +14,11 @@ type RegisteredCommand = { handler: CommandHandler };
 
 type RegisteredFlag = { name: string; description: string; type?: "boolean" | "string" };
 
+
+function projectScope(): string {
+  const result = Bun.spawnSync(["git", "-C", process.cwd(), "rev-parse", "--show-toplevel"]);
+  return `project:${basename(new TextDecoder().decode(result.stdout).trim()).toLowerCase()}`;
+}
 
 
 function extensionStub(initialFlag?: unknown) {
@@ -67,7 +74,7 @@ test("registers acm-mode flag", () => {
   ]);
 });
 
-test("session start probes health then renders ready status footer", async () => {
+test("session start probes health then renders connected status footer", async () => {
   const previousWidget = process.env.ACM_WIDGET;
   delete process.env.ACM_WIDGET;
   const { handlers } = extensionStub();
@@ -83,7 +90,7 @@ test("session start probes health then renders ready status footer", async () =>
   };
   try {
     await sessionStart({} as never, { hasUI: true, ui: { setStatus } } as never);
-    expect(setStatus).toHaveBeenCalledWith("acm", "ACM full · ready");
+    expect(setStatus).toHaveBeenCalledWith("acm", "ACM full · connected");
   } finally {
     globalThis.fetch = originalFetch;
     if (previousWidget === undefined) delete process.env.ACM_WIDGET;
@@ -455,7 +462,7 @@ test("armed compaction match keeps unrelated preserve data but discards stale pa
       {
         url: "http://localhost:8927/compact/match",
         body: {
-          scope: "project:feat-acm-omp-extension",
+          scope: projectScope(),
           conversation: [{ role: "user", content: "history" }],
           turn_prefix: [{ role: "assistant", content: "split turn" }],
           previous_summary: "earlier",
@@ -926,7 +933,7 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
     expect(requests[0]).toMatchObject({
       url: "http://localhost:8927/ingest",
       body: {
-        scope: "project:feat-acm-omp-extension",
+        scope: projectScope(),
         source_ref: "session:session-2",
         text: "user: Use Pro billing.\nassistant: I will retain billing scope.\nassistant: Existing billing record is stable.",
       },

@@ -1,6 +1,7 @@
 [project]
 name = "acm-service"
 version = "0.1.0"
+license = "MIT"
 description = "Agentic Context Management service (arXiv 2607.21503) for oh-my-pi"
 requires-python = ">=3.11"
 dependencies = [

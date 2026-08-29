@@ -32,7 +32,7 @@ ACM adds per-agent generated memory architecture, anticipatory retrieval (trajec
 
 ACM has three modes: `full` (default), `memory` (ACM memory only with native compaction), and `compaction` (ACM compaction only, coexisting with Hindsight/Mnemopi as `memory.backend`). Configure with `--acm-mode` or `ACM_MODE`.
 
-Interactive sessions show status below editor: mode, bundle hits/misses, harvested count, and latest compaction score. At session start, ACM probes health then renders `ACM <mode> · ready` or `offline`.
+Interactive sessions show status below editor: mode, bundle hits/misses, harvested count, and latest compaction score. At session start, ACM probes health then renders `ACM <mode> · connected` or `offline`.
 
 ### Honest limitations
 
@@ -51,9 +51,13 @@ Interactive sessions show status below editor: mode, bundle hits/misses, harvest
 - Docker
 - Ollama, with `qwen3:4b` and `qwen3-embedding:0.6b` (1024 dimensions) reachable on port `11434`, from a native install or container
 
-Clone this repository, then start local dependencies and ACM:
+Clone this repository, pull required Ollama models, then start local dependencies and ACM:
 
 ```bash
+git clone https://github.com/5c0r/omp_acm_extension.git
+cd omp_acm_extension
+ollama pull qwen3:4b
+ollama pull qwen3-embedding:0.6b
 docker compose -p acm up -d --build
 ```
 
@@ -62,10 +66,10 @@ The service listens on `127.0.0.1:8927`; Postgres listens on `127.0.0.1:5433`.
 Link the extension:
 
 ```bash
-ln -s <repo>/extension ~/.omp/agent/extensions/acm
+ln -s "$(pwd)/extension" "$HOME/.omp/agent/extensions/acm"
 ```
 
-Start a fresh `omp` session. Footer should show `ACM <mode> · ready`; run `/acm selfcheck` until every row is `PASS`, then run `/acm status`.
+Start a fresh `omp` session. Footer should show `ACM <mode> · connected`; run `/acm selfcheck` until every row is `PASS`, then run `/acm status`.
 
 ### Runbook
 
@@ -97,7 +101,7 @@ Select a preset at OMP startup with `omp --acm-mode=<mode>` or `ACM_MODE=<mode> 
 
 | Environment | Default | Effect |
 |---|---|---|
-| `ACM_WIDGET` | on | Set `0` to disable ACM footer status line (env name kept for compatibility). Session start probes health then renders `ACM <mode> · ready` or `offline`; activity counts advance only after verified ACM responses. |
+| `ACM_WIDGET` | on | Set `0` to disable ACM footer status line (env name kept for compatibility). Session start probes health then renders `ACM <mode> · connected` or `offline`; activity counts advance only after verified ACM responses. |
 
 OMP extensions cannot read arbitrary `config.yml` keys; use flag or env until OMP core exposes extension settings. `compaction` leaves memory ownership to Hindsight/Mnemopi; no Hindsight-to-ACM bridge exists.
 

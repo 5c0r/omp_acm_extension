@@ -177,7 +177,7 @@ export default function acmExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!statusLineEnabled || !ctx.hasUI) return;
     serviceOnline = (await acmRequest("/health")) !== null;
-    setStatusBar(ctx, `ACM ${getMode().mode} · ${serviceOnline ? "ready" : "offline"}`);
+    setStatusBar(ctx, `ACM ${getMode().mode} · ${serviceOnline ? "connected" : "offline"}`);
   });
   const z = pi.zod;
 
