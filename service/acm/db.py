@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS prefetch (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS bundle (
+    session_id        text PRIMARY KEY,
+    scope_id          integer NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
+    rendered          text NOT NULL,
+    predicted_intents jsonb NOT NULL,
+    served_count      integer NOT NULL DEFAULT 0,
+    expires_at        timestamptz NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS stats (
     key   text PRIMARY KEY,
     value jsonb NOT NULL
@@ -164,8 +174,8 @@ def scope_chain(scope_id: int) -> list[int]:
 def bump_stat(key: str, amount: int = 1) -> None:
     with connect() as conn:
         conn.execute(
-            "INSERT INTO stats (key, value) VALUES (%(k)s, %(v)s::jsonb) "
+            "INSERT INTO stats (key, value) VALUES (%(k)s, to_jsonb(%(v)s::integer)) "
             "ON CONFLICT (key) DO UPDATE SET value = "
-            "(stats.value::numeric + %(v)s)::jsonb",
+            "to_jsonb(((stats.value #>> '{}')::integer + %(v)s::integer))",
             {"k": key, "v": amount},
         )
