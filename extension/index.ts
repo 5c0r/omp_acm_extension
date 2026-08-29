@@ -312,7 +312,9 @@ export default function acmExtension(pi: ExtensionAPI) {
           ctx.ui.notify(`ACM browse (non-interactive):\n${scopes.map(([scope, count]) => `${scope} (${count})`).join("\n")}`, "info");
           return;
         }
-        const scope = await ctx.ui.select("ACM browse — scope", scopes.map(([label, count]) => ({ label, description: `${count} memories` })));
+        const scopeChoices = scopes.map(([scope, count]) => `${scope} — ${count} memories`);
+        const selectedScope = await ctx.ui.select("ACM browse — scope", scopeChoices);
+        const scope = scopes.find(([candidate, count]) => `${candidate} — ${count} memories` === selectedScope)?.[0];
         if (!scope) return;
         const listed = await acmRequest<{ items?: BrowseMemory[] }>(`/api/ui/memories?scope=${encodeURIComponent(scope)}&limit=100`);
         const memories = listed?.items ?? [];
@@ -322,10 +324,9 @@ export default function acmExtension(pi: ExtensionAPI) {
         }
         const choices = memories.map(memory => ({
           memory,
-          label: `#${memory.id} [${memory.kind}] ${memory.content.slice(0, 72)}`,
-          description: memory.status,
+          label: `#${memory.id} [${memory.kind}] ${memory.content.slice(0, 72)} — ${memory.status}`,
         }));
-        const selectedLabel = await ctx.ui.select("ACM browse — memory", choices.map(({ label, description }) => ({ label, description })));
+        const selectedLabel = await ctx.ui.select("ACM browse — memory", choices.map(choice => choice.label));
         const selected = choices.find(choice => choice.label === selectedLabel)?.memory;
         if (!selected) return;
         let current = (await acmRequest<BrowseMemory>(`/api/ui/memories/${selected.id}`)) ?? selected;
@@ -380,7 +381,7 @@ export default function acmExtension(pi: ExtensionAPI) {
           }
           if (action === "Merge into…") {
             const targets = choices.filter(choice => choice.memory.id !== current.id && choice.memory.status === "active");
-            const targetLabel = await ctx.ui.select("Merge into", targets.map(({ label, description }) => ({ label, description })));
+            const targetLabel = await ctx.ui.select("Merge into", targets.map(choice => choice.label));
             const target = targets.find(choice => choice.label === targetLabel)?.memory;
             if (!target || !await ctx.ui.confirm("Merge ACM memory", `Merge #${current.id} into #${target.id}? Source becomes archived.`)) continue;
             const updated = await acmRequest<BrowseMemory>(`/memories/${current.id}/merge`, "POST", { target_id: target.id });

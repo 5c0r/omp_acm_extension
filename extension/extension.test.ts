@@ -192,6 +192,75 @@ test("/acm browse prints scope summary without interactive UI", async () => {
 });
 
 
+test("/acm browse passes string-only scope options to native UI", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  let scopeOptions: unknown[] = [];
+  globalThis.fetch = async () => new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 2 } } }));
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async (_title: string, options: unknown[]) => {
+          scopeOptions = options;
+          return undefined;
+        },
+        notify: () => undefined,
+      },
+    } as never);
+    expect(scopeOptions).toEqual(["project:browse-live — 2 memories"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+
+test("/acm browse passes string-only memory and merge options to native UI", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const selectors = new Map<string, unknown[]>();
+  const actions = ["Merge into…", "Done"];
+  globalThis.fetch = async url => {
+    const address = String(url);
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 2 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [
+      { id: 41, kind: "fact", content: "Source memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false },
+      { id: 42, kind: "fact", content: "Target memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false },
+    ] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Source memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+    return new Response(JSON.stringify({ id: 42, kind: "fact", content: "Target memory", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async (title: string, options: unknown[]) => {
+          selectors.set(title, options);
+          if (title === "ACM browse — scope") return "project:browse-live — 2 memories";
+          if (title === "ACM browse — memory") return "#41 [fact] Source memory — active";
+          if (title === "ACM memory actions") return actions.shift();
+          return "#42 [fact] Target memory — active";
+        },
+        confirm: async () => true,
+        notify: () => undefined,
+      },
+    } as never);
+    expect(selectors.get("ACM browse — memory")).toEqual(["#41 [fact] Source memory — active", "#42 [fact] Target memory — active"]);
+    expect(selectors.get("Merge into")).toEqual(["#42 [fact] Target memory — active"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("/acm browse edits selected memory through native dialogs", async () => {
   const { commandHandlers } = extensionStub();
   const handler = commandHandlers.acm;
@@ -200,7 +269,7 @@ test("/acm browse edits selected memory through native dialogs", async () => {
 
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
-  const selections = ["project:browse-live", "#41 [fact] Widget API key rotates weekly", "Edit", "Done"];
+  const selections = ["project:browse-live — 1 memories", "#41 [fact] Widget API key rotates weekly — active", "Edit", "Done"];
   const editor = vi.fn(async () => "Widget API key rotates monthly");
   globalThis.fetch = async (url, init) => {
     const address = String(url);
@@ -239,7 +308,7 @@ test("/acm browse retains linked entities after a memory mutation", async () => 
 
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
-  const selections = ["project:browse-live", "#41 [fact] Widget API key rotates weekly", "Pin", "Add alias", "#9 widget", "Done"];
+  const selections = ["project:browse-live — 1 memories", "#41 [fact] Widget API key rotates weekly — active", "Pin", "Add alias", "#9 widget", "Done"];
   globalThis.fetch = async (url, init) => {
     const address = String(url);
     requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
