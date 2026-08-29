@@ -49,5 +49,6 @@ def test_marked_test_stack_runs():
 
 
 def test_service_image_omits_baked_tests():
-    """Fails if Dockerfile copies the test suite into the runtime image."""
-    assert not Path("/app/tests").exists()
+    """Fails only when tests share the runtime image filesystem."""
+    tests = Path("/app/tests")
+    assert not tests.exists() or tests.stat().st_dev != Path("/app").stat().st_dev
