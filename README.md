@@ -40,13 +40,27 @@ ln -s /Users/tri.nguyen/Projekti/petty/acm-worktrees/feat-acm-omp-extension/exte
   ~/.omp/agent/extensions/acm
 ```
 
-`/acm status` reports health/stats. `/acm selfcheck` uses its own `project:acm-selfcheck-<session>` scope and `acm-selfcheck-<session>` bundle key, then prints endpoint pass/fail rows. `/acm inject on|off` toggles bundle injection for current runtime. `/acm last-compaction` shows latest validated hook result.
+`/acm status` reports active mode, health, and stats. `/acm selfcheck` uses its own `project:acm-selfcheck-<session>` scope and `acm-selfcheck-<session>` bundle key, then prints endpoint pass/fail rows. `/acm inject on|off` toggles bundle injection for current runtime. `/acm last-compaction` shows latest validated hook result.
 
 Disable extension through OMP settings:
 
 ```json
 { "disabledExtensions": ["extension-module:acm"] }
 ```
+
+## Mode presets
+
+Select a preset at OMP startup with `omp --acm-mode=<mode>` or `ACM_MODE=<mode> omp`. `ACM_MODE` takes precedence over `--acm-mode`; absent config selects `full`.
+
+| Preset | Agent-end ingest | Anticipation and automatic bundle injection | Automatic compaction hook |
+|---|---:|---:|---:|
+| `full` | On | On | On |
+| `memory` | On | On | Off |
+| `compaction` | Off | Off | On |
+
+`ACM_AUTO_INJECT=0` and `ACM_AUTO_ARM` retain their existing granular behavior inside applicable presets. `acm_compact` remains available in every preset.
+
+OMP extensions cannot read arbitrary `config.yml` keys; use flag or env until OMP core exposes extension settings. `compaction` leaves memory ownership to Hindsight/Mnemopi; no Hindsight-to-ACM bridge exists.
 
 ## OMP today vs the paper (evidence-verified)
 

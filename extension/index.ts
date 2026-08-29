@@ -44,6 +44,29 @@ function fileOps(value: unknown): { read: string[]; written: string[]; edited: s
   return { read: paths("read"), written: paths("written"), edited: paths("edited") };
 }
 
+type AcmMode = "full" | "memory" | "compaction";
+type ModePreset = { ingest: boolean; anticipate: boolean; compactHook: boolean };
+type ResolvedMode = ModePreset & { mode: AcmMode };
+
+const MODE_PRESETS: Record<AcmMode, ModePreset> = {
+  full: { ingest: true, anticipate: true, compactHook: true },
+  memory: { ingest: true, anticipate: true, compactHook: false },
+  compaction: { ingest: false, anticipate: false, compactHook: true },
+};
+
+function resolveMode(pi: ExtensionAPI): ResolvedMode {
+  const flag = pi.getFlag("acm-mode");
+  const raw = process.env.ACM_MODE ?? (typeof flag === "string" && flag ? flag : undefined);
+  if (raw === undefined) return { mode: "full", ...MODE_PRESETS.full };
+  if (raw in MODE_PRESETS) {
+    const mode = raw as AcmMode;
+    return { mode, ...MODE_PRESETS[mode] };
+  }
+  pi.logger.warn(`ACM mode '${raw}' unknown; falling back to 'full' (expected full | memory | compaction)`);
+  return { mode: "full", ...MODE_PRESETS.full };
+}
+
+
 export function shouldAutoArm(
   state: { aboveThreshold: boolean; digest?: string; armedAt?: number },
   usageRatio: number,
@@ -93,6 +116,9 @@ function toolResult(response: unknown) {
 
 export default function acmExtension(pi: ExtensionAPI) {
   pi.setLabel("Agentic Context Management");
+  pi.registerFlag("acm-mode", { description: "ACM subsystem preset: full | memory | compaction", type: "string" });
+  let resolvedMode: ResolvedMode | undefined;
+  const getMode = () => resolvedMode ??= resolveMode(pi);
   const harvested = new Map<string, { seen: Set<string>; fifo: string[] }>();
   const latestUser = new Map<string, string>();
   let autoInject = process.env.ACM_AUTO_INJECT !== "0";
@@ -192,12 +218,13 @@ export default function acmExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const [command, value] = String(args).trim().split(/\s+/, 2);
       if (command === "status") {
+        const mode = getMode();
         const [health, stats] = await Promise.all([
           acmRequest<{ status?: string }>("/health"),
           acmRequest<{ stats?: Record<string, unknown> }>("/stats"),
         ]);
         const values = stats?.stats ?? {};
-        ctx.ui.notify(`ACM status: ${health?.status ?? "unavailable"}; bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}`, "info");
+        ctx.ui.notify(`ACM status: ${health?.status ?? "unavailable"}; mode=${mode.mode}; bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}`, "info");
         return;
       }
       if (command === "selfcheck") {
@@ -256,7 +283,7 @@ export default function acmExtension(pi: ExtensionAPI) {
 
 
   pi.on("session_before_compact", async (event, ctx) => {
-    if (event.signal.aborted) return {};
+    if (!getMode().compactHook || event.signal.aborted) return {};
     const preparation = event.preparation;
     const response = await acmRequest<CompactResponse>("/compact/match", "POST", {
       scope: projectScope(ctx.cwd),
@@ -281,6 +308,7 @@ export default function acmExtension(pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", (event, ctx) => {
+    if (!getMode().anticipate) return;
     const sessionId = ctx.sessionManager.getSessionId();
     const assistant = messages([event.message])[0];
     const trajectory = [
@@ -309,6 +337,7 @@ export default function acmExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event, ctx) => {
+    if (!getMode().ingest) return;
     const sessionId = ctx.sessionManager.getSessionId();
     const history = messages(event.messages);
     const seen = harvested.get(sessionId) ?? { seen: new Set<string>(), fifo: [] };
@@ -340,7 +369,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     const user = messages(event.messages).reverse().find(message => message.role === "user");
     if (user) latestUser.set(sessionId, user.content);
-    if (!autoInject) return {};
+    if (!getMode().anticipate || !autoInject) return {};
     const bundle = await acmRequest<{ rendered?: unknown }>(`/bundle/${sessionId}`);
     if (typeof bundle?.rendered !== "string" || !bundle.rendered.trim()) return {};
     return { messages: [{ role: "user", content: bundle.rendered }, ...event.messages] };

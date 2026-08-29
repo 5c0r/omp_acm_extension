@@ -10,14 +10,19 @@ type RegisteredTool = {
 type CommandHandler = (args: string, ctx: never) => Promise<void> | void;
 type RegisteredCommand = { handler: CommandHandler };
 
+type RegisteredFlag = { name: string; description: string; type?: "boolean" | "string" };
 
 
-function extensionStub() {
+
+function extensionStub(initialFlag?: unknown) {
+  let flagValue = initialFlag;
   const handlers: Record<string, ExtensionHandler> = {};
   const labels: string[] = [];
   const tools: RegisteredTool[] = [];
   const commands: string[] = [];
   const commandHandlers: Record<string, CommandHandler> = {};
+  const flags: RegisteredFlag[] = [];
+  const warnings: string[] = [];
   const schema = { optional: () => schema };
 
   acmExtension({
@@ -30,6 +35,9 @@ function extensionStub() {
       commands.push(name);
       commandHandlers[name] = command.handler;
     },
+    registerFlag: (name: string, flag: { description: string; type?: "boolean" | "string" }) => flags.push({ name, ...flag }),
+    getFlag: () => flagValue,
+    logger: { warn: (message: string) => warnings.push(message) },
     zod: {
       object: () => schema,
       string: () => schema,
@@ -38,7 +46,7 @@ function extensionStub() {
       array: () => schema,
     },
   } as never);
-  return { handlers, labels, tools, commands, commandHandlers };
+  return { handlers, labels, tools, commands, commandHandlers, flags, warnings, setFlag: (value: unknown) => { flagValue = value; } };
 }
 
 test("factory labels Agentic Context Management", () => {
@@ -51,6 +59,12 @@ test("registers complete ACM tool and command surface", () => {
   const { tools, commands } = extensionStub();
 
   expect(tools.map(tool => tool.name)).toEqual(["acm_fetch", "acm_ingest", "acm_compact", "acm_architect", "acm_status", "acm_consolidate"]);
+});
+
+test("registers acm-mode flag", () => {
+  expect(extensionStub().flags).toEqual([
+    { name: "acm-mode", description: "ACM subsystem preset: full | memory | compaction", type: "string" },
+  ]);
 });
 
 
@@ -70,7 +84,7 @@ test("/acm status reports service health and stats", async () => {
   try {
     await handler("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
     expect(urls).toEqual(["http://localhost:8927/health", "http://localhost:8927/stats"]);
-    expect(notices).toEqual(["ACM status: ok; bundle_injected=3; explicit_fetch=2"]);
+    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=3; explicit_fetch=2"]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -636,5 +650,147 @@ test("/acm last-compaction reports latest validated result", async () => {
     expect(notices).toEqual(["ACM last-compaction: score 0.90, ratio 0.20"]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("--acm-mode selects memory when ACM_MODE is unset", async () => {
+  const originalMode = process.env.ACM_MODE;
+  delete process.env.ACM_MODE;
+  const { commandHandlers, setFlag } = extensionStub();
+  setFlag("memory");
+  const handler = commandHandlers.acm;
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
+  try {
+    await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(notices).toEqual(["ACM status: ok; mode=memory; bundle_injected=0; explicit_fetch=0"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
+  }
+});
+
+test("ACM_MODE overrides --acm-mode", async () => {
+  const originalMode = process.env.ACM_MODE;
+  process.env.ACM_MODE = "compaction";
+  const { commandHandlers, setFlag } = extensionStub();
+  setFlag("memory");
+  const handler = commandHandlers.acm;
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
+  try {
+    await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(notices).toEqual(["ACM status: ok; mode=compaction; bundle_injected=0; explicit_fetch=0"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
+  }
+});
+
+test("unknown ACM_MODE warns once and falls back to full", async () => {
+  const originalMode = process.env.ACM_MODE;
+  process.env.ACM_MODE = "not-a-mode";
+  const { commandHandlers, warnings } = extensionStub();
+  const handler = commandHandlers.acm;
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
+  try {
+    expect(warnings).toEqual([]);
+    await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(warnings).toEqual(["ACM mode 'not-a-mode' unknown; falling back to 'full' (expected full | memory | compaction)"]);
+    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=0; explicit_fetch=0"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
+  }
+});
+
+test("compaction mode disables automatic ingestion, anticipation, and injection but retains compact hook", async () => {
+  const originalMode = process.env.ACM_MODE;
+  process.env.ACM_MODE = "compaction";
+  const { handlers } = extensionStub();
+  const agentEnd = handlers.agent_end;
+  const turnEnd = handlers.turn_end;
+  const context = handlers.context;
+  const compact = handlers.session_before_compact;
+  const originalFetch = globalThis.fetch;
+  const timers: Array<() => Promise<void>> = [];
+  const urls: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ summary: "validated", validation_score: 0.9, compression_ratio: 0.2, probes: [] }));
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "mode-session" },
+    setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+  };
+  try {
+    await agentEnd?.({ messages: [{ role: "user", content: "remember this" }] } as never, ctx as never);
+    await turnEnd?.({ message: { role: "assistant", content: "answer" }, toolResults: [] } as never, ctx as never);
+    const contextResult = await context?.({ messages: [{ role: "user", content: "question" }] } as never, ctx as never);
+    const compactResult = await compact?.({
+      signal: new AbortController().signal,
+      preparation: {
+        messagesToSummarize: [{ role: "user", content: "history" }],
+        turnPrefixMessages: [],
+        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+      },
+    } as never, ctx as never);
+    expect(timers).toEqual([]);
+    expect(urls).toEqual(["http://localhost:8927/compact/match"]);
+    expect(contextResult).toEqual({});
+    expect(compactResult).toMatchObject({ compaction: { summary: "validated" } });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
+  }
+});
+
+test("memory mode retains automatic ingestion and anticipation but skips compact hook", async () => {
+  const originalMode = process.env.ACM_MODE;
+  process.env.ACM_MODE = "memory";
+  const { handlers } = extensionStub();
+  const agentEnd = handlers.agent_end;
+  const turnEnd = handlers.turn_end;
+  const compact = handlers.session_before_compact;
+  const originalFetch = globalThis.fetch;
+  const timers: Array<() => Promise<void>> = [];
+  const urls: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ summary: "validated", validation_score: 0.9, compression_ratio: 0.2, probes: [] }));
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "memory-session" },
+    setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+  };
+  try {
+    await agentEnd?.({ messages: [{ role: "user", content: "remember this" }] } as never, ctx as never);
+    await turnEnd?.({ message: { role: "assistant", content: "answer" }, toolResults: [] } as never, ctx as never);
+    const compactResult = await compact?.({
+      signal: new AbortController().signal,
+      preparation: {
+        messagesToSummarize: [{ role: "user", content: "history" }],
+        turnPrefixMessages: [],
+        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+      },
+    } as never, ctx as never);
+    await timers[0]?.();
+    await timers[1]?.();
+    expect(compactResult).toEqual({});
+    expect(urls).toEqual(["http://localhost:8927/ingest", "http://localhost:8927/anticipate"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
   }
 });
