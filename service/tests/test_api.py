@@ -2,11 +2,17 @@ import os
 import time
 import uuid
 
+_OLLAMA_URL = os.environ.get("ACM_OLLAMA_URL")
 os.environ["ACM_OLLAMA_URL"] = "http://127.0.0.1:1"
 
 from fastapi.testclient import TestClient
 
 from acm.api import app
+
+if _OLLAMA_URL is None:
+    os.environ.pop("ACM_OLLAMA_URL")
+else:
+    os.environ["ACM_OLLAMA_URL"] = _OLLAMA_URL
 
 
 def test_api_exposes_lifecycle_routes_under_lifespan():

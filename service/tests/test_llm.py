@@ -83,9 +83,10 @@ server = HTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 os.environ["ACM_OLLAMA_URL"] = f"http://127.0.0.1:{server.server_port}"
 from acm.llm import chat_json
-assert chat_json("x", "y") == {"ok": True}
+assert chat_json("x", "y", max_tokens=64) == {"ok": True}
 assert Handler.calls == 2
 assert Handler.requests[0]["think"] is False
+assert Handler.requests[0]["options"]["num_predict"] == 64
 server.shutdown()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)

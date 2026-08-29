@@ -5,6 +5,8 @@ from typing import Any
 
 from . import db
 from .llm import chat_json, tokens
+from .sanitize import sanitize
+
 from .retrieve import fetch, scope_id
 
 BUNDLE_TTL = timedelta(minutes=10)
@@ -39,7 +41,7 @@ def _render(items: list[dict[str, Any]]) -> str:
         provenance = f"{item['scope']} · {item['kind']}"
         if item["source_ref"]:
             provenance += f" · {item['source_ref']}"
-        line = f"- [{provenance}] {item['content']}"
+        line = sanitize(f"- [{provenance}] {item['content']}")
         if used + tokens(line) > BUNDLE_BUDGET:
             break
         used += tokens(line)
@@ -83,4 +85,4 @@ def get_bundle(session_id: str) -> dict[str, Any] | None:
     if not row:
         return None
     db.bump_stat("bundle_injected")
-    return row
+    return {**row, "rendered": sanitize(row["rendered"])}

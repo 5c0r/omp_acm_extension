@@ -3,6 +3,8 @@ import os
 from typing import Any
 
 from . import db
+from .sanitize import sanitize
+
 from .llm import embed
 
 TRIGRAM_THRESHOLD = float(os.environ.get("ACM_ENTITY_TRIGRAM", "0.75"))
@@ -75,10 +77,10 @@ def _cosine(name: str, scopes: list[int]) -> tuple[dict[str, Any] | None, list[f
 
 def resolve_entity(name: str, scope_id: int, aliases: list[str] | None = None) -> dict[str, Any]:
     """Resolve or register `name`; never creates a duplicate above configured thresholds."""
-    name = name.strip()
+    name = sanitize(name)
     if not name:
         raise ValueError("entity name is required")
-    aliases = list(dict.fromkeys(alias.strip() for alias in aliases or [] if alias.strip()))
+    aliases = list(dict.fromkeys(sanitize(alias) for alias in aliases or [] if isinstance(alias, str) and sanitize(alias)))
     scopes = _scope_order(scope_id)
     for candidate in (_exact(name, scopes), _trigram(name, scopes)):
         if candidate:

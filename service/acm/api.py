@@ -56,7 +56,6 @@ class CompactRequest(BaseModel):
     previous_summary: str | None = None
     custom_instructions: str | None = None
     file_ops: dict[str, list[str]] | None = None
-    previous_preserve_data: dict[str, Any] | None = None
     policy: str | None = None
 
 
@@ -128,7 +127,6 @@ def compact_session(request: CompactRequest) -> dict[str, Any]:
         request.previous_summary,
         request.custom_instructions,
         request.file_ops,
-        request.previous_preserve_data,
         request.policy,
     )
 

@@ -13,7 +13,7 @@ TIMEOUT = float(os.environ.get("ACM_LLM_TIMEOUT", "120"))
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
-def chat_json(system: str, user: str, schema_hint: str = "") -> dict | None:
+def chat_json(system: str, user: str, schema_hint: str = "", max_tokens: int | None = None) -> dict | None:
     """Strict-JSON chat, repair-retry x2, None on failure."""
     if schema_hint:
         system = f"{system}\n\nReturn only a JSON object matching: {schema_hint}"
@@ -27,7 +27,7 @@ def chat_json(system: str, user: str, schema_hint: str = "") -> dict | None:
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                     "stream": False,
                     "format": "json",
-                    "options": {"temperature": 0},
+                    "options": {"temperature": 0, **({"num_predict": max_tokens} if max_tokens else {})},
                 },
                 timeout=TIMEOUT,
             )

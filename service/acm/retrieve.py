@@ -8,6 +8,8 @@ import httpx
 from . import db
 from .entities import vector_literal
 from .llm import chat_json, embed, tokens
+from .sanitize import sanitize
+
 
 RRF_K = int(os.environ.get("ACM_RRF_K", "60"))
 
@@ -79,7 +81,7 @@ def _item(row: dict[str, Any], score: float, via_graph: bool) -> dict[str, Any]:
     return {
         "id": row["id"],
         "kind": row["kind"],
-        "content": row["content"],
+        "content": sanitize(row["content"]),
         "importance": row["importance"],
         "valid_from": row["valid_from"],
         "valid_until": row["valid_until"],

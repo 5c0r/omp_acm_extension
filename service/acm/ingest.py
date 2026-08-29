@@ -13,6 +13,8 @@ from . import db
 from .architect import generate_architecture
 from .entities import COSINE_THRESHOLD, resolve_entity, vector_literal
 from .llm import chat_json, embed
+from .sanitize import sanitize
+
 
 _jobs: queue.Queue[int] = queue.Queue()
 _worker: threading.Thread | None = None
@@ -44,6 +46,7 @@ def start_worker() -> None:
 
 
 def submit(scope: str, text: str, source_ref: str | None = None) -> int:
+    text = sanitize(text)
     scope_id = _scope_id(scope)
     digest = hashlib.sha256(text.encode()).hexdigest()
     with db.connect() as conn:
@@ -95,7 +98,7 @@ def _extract(scope_id: int, text: str) -> dict[str, Any]:
         f"Architecture:\n{json.dumps(architecture)}\n\nText:\n{text}",
         _EXTRACT_SCHEMA,
     )
-    if isinstance(extracted, dict) and isinstance(extracted.get("memories"), list):
+    if isinstance(extracted, dict) and isinstance(extracted.get("memories"), list) and extracted["memories"]:
         return extracted
     # ponytail: retain source text as one fact when model unavailable; richer extraction resumes automatically.
     return {"memories": [{"kind": "fact", "content": text, "importance": 0.5, "entities": []}], "relations": []}
@@ -103,7 +106,10 @@ def _extract(scope_id: int, text: str) -> dict[str, Any]:
 
 def _memory(scope_id: int, item: dict[str, Any], source_ref: str | None) -> int | None:
     content = item.get("content")
-    if not isinstance(content, str) or not content.strip():
+    if not isinstance(content, str):
+        return None
+    content = sanitize(content)
+    if not content:
         return None
     kind = item.get("kind") if item.get("kind") in {"fact", "preference", "episode", "decision"} else "fact"
     importance = item.get("importance", 0.5)
@@ -173,18 +179,21 @@ def _edges(scope_id: int, memory_id: int, relations: Any, entities: dict[str, in
     for relation in relations:
         if not isinstance(relation, dict) or not all(isinstance(relation.get(key), str) for key in ("from", "to", "relation")):
             continue
-        from_id = entities.get(relation["from"].casefold()) or resolve_entity(relation["from"], scope_id)["id"]
-        to_id = entities.get(relation["to"].casefold()) or resolve_entity(relation["to"], scope_id)["id"]
+        from_name, to_name, relation_name = (sanitize(relation[key]) for key in ("from", "to", "relation"))
+        if not all((from_name, to_name, relation_name)):
+            continue
+        from_id = entities.get(from_name.casefold()) or resolve_entity(from_name, scope_id)["id"]
+        to_id = entities.get(to_name.casefold()) or resolve_entity(to_name, scope_id)["id"]
         with db.connect() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM edge WHERE scope_id = %s AND from_entity = %s AND to_entity = %s "
                 "AND relation = %s AND memory_id = %s",
-                (scope_id, from_id, to_id, relation["relation"], memory_id),
+                (scope_id, from_id, to_id, relation_name, memory_id),
             ).fetchone()
             if not exists:
                 conn.execute(
                     "INSERT INTO edge (scope_id, from_entity, to_entity, relation, memory_id) VALUES (%s, %s, %s, %s, %s)",
-                    (scope_id, from_id, to_id, relation["relation"], memory_id),
+                    (scope_id, from_id, to_id, relation_name, memory_id),
                 )
 
 

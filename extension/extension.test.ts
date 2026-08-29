@@ -1,0 +1,536 @@
+import { expect, test, vi } from "bun:test";
+
+import acmExtension from "./index";
+
+type ExtensionHandler = (event: never, ctx: never) => Promise<unknown> | unknown;
+type RegisteredTool = {
+  name: string;
+  execute: (...args: never[]) => Promise<unknown>;
+};
+type CommandHandler = (args: string, ctx: never) => Promise<void> | void;
+type RegisteredCommand = { handler: CommandHandler };
+
+
+
+function extensionStub() {
+  const handlers: Record<string, ExtensionHandler> = {};
+  const labels: string[] = [];
+  const tools: RegisteredTool[] = [];
+  const commands: string[] = [];
+  const commandHandlers: Record<string, CommandHandler> = {};
+  const schema = { optional: () => schema };
+
+  acmExtension({
+    setLabel: (label: string) => labels.push(label),
+    on: (event: string, handler: ExtensionHandler) => {
+      handlers[event] = handler;
+    },
+    registerTool: (tool: RegisteredTool) => tools.push(tool),
+    registerCommand: (name: string, command: RegisteredCommand) => {
+      commands.push(name);
+      commandHandlers[name] = command.handler;
+    },
+    zod: {
+      object: () => schema,
+      string: () => schema,
+      number: () => schema,
+      boolean: () => schema,
+      array: () => schema,
+    },
+  } as never);
+  return { handlers, labels, tools, commands, commandHandlers };
+}
+
+test("factory labels Agentic Context Management", () => {
+  const { labels } = extensionStub();
+
+  expect(labels).toEqual(["Agentic Context Management"]);
+});
+
+test("registers complete ACM tool and command surface", () => {
+  const { tools, commands } = extensionStub();
+
+  expect(tools.map(tool => tool.name)).toEqual(["acm_fetch", "acm_ingest", "acm_compact", "acm_architect", "acm_status", "acm_consolidate"]);
+});
+
+
+test("/acm status reports service health and stats", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const urls: string[] = [];
+  const notices: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: { bundle_injected: "3", explicit_fetch: "2" } }));
+  };
+  try {
+    await handler("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(urls).toEqual(["http://localhost:8927/health", "http://localhost:8927/stats"]);
+    expect(notices).toEqual(["ACM status: ok; bundle_injected=3; explicit_fetch=2"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/acm selfcheck exercises every ACM endpoint", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body?: Record<string, unknown> }> = [];
+  const notices: string[] = [];
+  let bundleCalls = 0;
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.includes("/bundle/") && ++bundleCalls === 1) return new Response("{}", { status: 404 });
+    return new Response(JSON.stringify(address.endsWith("/ingest") ? { job_id: 7 } : { ok: true }));
+  };
+  try {
+    await handler("selfcheck", {
+      cwd: "/tmp/acm-selfcheck",
+      sessionManager: { getSessionId: () => "session-5" },
+      ui: { notify: (message: string) => notices.push(message) },
+    } as never);
+    expect(requests.map(request => request.url)).toEqual([
+      "http://localhost:8927/health",
+      "http://localhost:8927/architect",
+      "http://localhost:8927/ingest",
+      "http://localhost:8927/status/7",
+      "http://localhost:8927/fetch",
+      "http://localhost:8927/anticipate",
+      "http://localhost:8927/bundle/acm-selfcheck-session-5",
+      "http://localhost:8927/bundle/acm-selfcheck-session-5",
+      "http://localhost:8927/compact",
+      "http://localhost:8927/consolidate",
+      "http://localhost:8927/stats",
+    ]);
+    expect(requests.filter(request => request.body?.scope).map(request => request.body?.scope)).toEqual([
+      "project:acm-selfcheck-session-5",
+      "project:acm-selfcheck-session-5",
+      "project:acm-selfcheck-session-5",
+      "project:acm-selfcheck-session-5",
+      "project:acm-selfcheck-session-5",
+    ]);
+    expect(requests.find(request => request.url.endsWith("/anticipate"))?.body?.session_id).toBe("acm-selfcheck-session-5");
+    expect(notices).toEqual([[
+      "ACM selfcheck",
+      "health       PASS",
+      "architect    PASS",
+      "ingest       PASS",
+      "status       PASS",
+      "fetch        PASS",
+      "anticipate   PASS",
+      "bundle       PASS",
+      "compact      PASS",
+      "consolidate  PASS",
+      "stats        PASS",
+    ].join("\n")]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/acm inject toggles runtime bundle injection", async () => {
+  const { commandHandlers, handlers } = extensionStub();
+  const command = commandHandlers.acm;
+  const context = handlers.context;
+  expect(command).toBeTypeOf("function");
+  expect(context).toBeTypeOf("function");
+  if (!command || !context) return;
+
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  const urls: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ rendered: "[acm memory]" }));
+  };
+  const ctx = { sessionManager: { getSessionId: () => "session-6" }, ui: { notify: (message: string) => notices.push(message) } };
+  try {
+    await command("inject off", ctx as never);
+    expect(await context({ messages: [] } as never, ctx as never)).toEqual({});
+    await command("inject on", ctx as never);
+    expect(await context({ messages: [] } as never, ctx as never)).toEqual({ messages: [{ role: "user", content: "[acm memory]" }] });
+    expect(urls).toEqual(["http://localhost:8927/bundle/session-6"]);
+    expect(notices).toEqual(["ACM injection off", "ACM injection on"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("tools route scoped requests to ACM endpoints", async () => {
+  const { tools } = extensionStub();
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body?: Record<string, unknown> }> = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    return new Response(JSON.stringify({ ok: true }));
+  };
+  const context = { cwd: "/tmp/acm-tools", sessionManager: { getSessionId: () => "session-3" } };
+  const invoke = async (name: string, params: Record<string, unknown>) => {
+    const tool = tools.find(candidate => candidate.name === name);
+    expect(tool).toBeDefined();
+    return tool?.execute("call-1" as never, params as never, new AbortController().signal as never, undefined as never, context as never);
+  };
+  try {
+    await invoke("acm_fetch", { query: "billing", budget_tokens: 600, deep: true });
+    await invoke("acm_ingest", { text: "retain this", source_ref: "note-1", scope: "project:shared" });
+    await invoke("acm_compact", {
+      conversation: "compact this",
+      budget_tokens: 100,
+      file_ops: { read: ["src/a.ts"], written: [], edited: ["src/a.ts"] },
+      custom_instructions: "retain rollout details",
+    });
+    await invoke("acm_architect", { description: "billing memory", reference: "ADR-1" });
+    await invoke("acm_status", { job_id: 7 });
+    await invoke("acm_consolidate", { scope: "project:shared" });
+    expect(requests).toEqual([
+      { url: "http://localhost:8927/fetch", body: { query: "billing", scope: "project:acm-tools", budget_tokens: 600, deep: true } },
+      { url: "http://localhost:8927/ingest", body: { scope: "project:shared", text: "retain this", source_ref: "note-1" } },
+      { url: "http://localhost:8927/compact", body: {
+        conversation: [{ role: "user", content: "compact this" }],
+        budget_tokens: 100,
+        file_ops: { read: ["src/a.ts"], written: [], edited: ["src/a.ts"] },
+        custom_instructions: "retain rollout details",
+      } },
+      { url: "http://localhost:8927/architect", body: { scope: "project:acm-tools", description: "billing memory", reference: "ADR-1" } },
+      { url: "http://localhost:8927/status/7", body: undefined },
+      { url: "http://localhost:8927/consolidate", body: { scope: "project:shared" } },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("turn end queues a bounded trajectory for anticipation", async () => {
+  const { handlers } = extensionStub();
+  const contextHandler = handlers.context;
+  const turnEndHandler = handlers.turn_end;
+  expect(contextHandler).toBeTypeOf("function");
+  expect(turnEndHandler).toBeTypeOf("function");
+  if (!contextHandler || !turnEndHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const timers: Array<() => Promise<void>> = [];
+  const ctx = {
+    cwd: "/tmp/acm-turn",
+    sessionManager: { getSessionId: () => "session-4" },
+    setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+  };
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : {} });
+    return new Response("{}", { status: 404 });
+  };
+  try {
+    await contextHandler({ messages: [{ role: "user", content: "Review billing rollout." }] } as never, ctx as never);
+    requests.length = 0;
+    await turnEndHandler({
+      message: { role: "assistant", content: "Billing rollout reviewed." },
+      toolResults: [{ toolName: "read", content: [{ type: "text", text: "x".repeat(600) }] }],
+    } as never, ctx as never);
+    expect(timers).toHaveLength(1);
+    await timers[0]?.();
+    expect(requests[0]).toMatchObject({
+      url: "http://localhost:8927/anticipate",
+      body: { session_id: "session-4", scope: "project:acm-turn" },
+    });
+    const trajectory = requests[0]?.body.trajectory as Array<{ role: string; content: string }>;
+    expect(trajectory.slice(0, 2)).toEqual([
+      { role: "user", content: "Review billing rollout." },
+      { role: "assistant", content: "Billing rollout reviewed." },
+    ]);
+    expect(trajectory[2]?.content).toStartWith("read: ");
+    expect(trajectory[2]?.content.length).toBeLessThanOrEqual(512);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("validated compaction keeps unrelated preserve data but discards stale compaction payloads", async () => {
+  const { handlers } = extensionStub();
+  const compactHandler = handlers.session_before_compact;
+
+  expect(compactHandler).toBeTypeOf("function");
+  if (!compactHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return new Response(
+      JSON.stringify({ summary: "validated", validation_score: 0.9, compression_ratio: 0.2, probes: [{ question: "q1", reference_answer: "a1", summary_answer: "a1", verdict: "correct" }] }),
+      { status: 200 },
+    );
+  };
+  try {
+    const result = await compactHandler(
+      {
+        signal: new AbortController().signal,
+        customInstructions: "keep deployment details",
+        preparation: {
+          messagesToSummarize: [{ role: "user", content: "history" }],
+          turnPrefixMessages: [{ role: "assistant", content: "split turn" }],
+          previousSummary: "earlier",
+          fileOps: { read: new Set(["deploy.ts"]), written: new Set(), edited: new Set(["deploy.ts"]) },
+          previousPreserveData: { openaiRemoteCompaction: { replay: 1 }, snapcompact: { version: 1 }, unrelated: { keep: true } },
+          firstKeptEntryId: "entry-1",
+          tokensBefore: 42,
+        },
+      },
+      {},
+    );
+
+    expect(requests).toEqual([
+      {
+        url: "http://localhost:8927/compact",
+        body: {
+          conversation: [{ role: "user", content: "history" }],
+          turn_prefix: [{ role: "assistant", content: "split turn" }],
+          previous_summary: "earlier",
+          custom_instructions: "keep deployment details",
+          file_ops: { read: ["deploy.ts"], written: [], edited: ["deploy.ts"] },
+          budget_tokens: 1500,
+
+        },
+      },
+    ]);
+    expect(result).toEqual({
+      compaction: {
+        summary: "validated",
+        shortSummary: "ACM validated (score 0.90, ratio 0.20)",
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 42,
+        preserveData: {
+          unrelated: { keep: true },
+          acm: {
+            validationScore: 0.9,
+            compressionRatio: 0.2,
+            probes: [{ question: "q1", reference_answer: "a1", summary_answer: "a1", verdict: "correct" }],
+          },
+        },
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("context prepends only a ready session bundle", async () => {
+  const { handlers } = extensionStub();
+  const contextHandler = handlers.context;
+  expect(contextHandler).toBeTypeOf("function");
+  if (!contextHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const urls: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ rendered: "[acm memory]\n- [project:test] Pro plan" }), { status: 200 });
+  };
+  try {
+    const result = await contextHandler(
+      { messages: [{ role: "user", content: "live question" }] } as never,
+      { sessionManager: { getSessionId: () => "session-1" } } as never,
+    );
+    expect(urls).toEqual(["http://localhost:8927/bundle/session-1"]);
+    expect(result).toEqual({
+      messages: [
+        { role: "user", content: "[acm memory]\n- [project:test] Pro plan" },
+        { role: "user", content: "live question" },
+      ],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+if (process.env.ACM_LIVE_TEST === "1") {
+  test("live compact hook completes below OMP's 30-second handler cap", async () => {
+    const { handlers } = extensionStub();
+    const compactHandler = handlers.session_before_compact;
+    expect(compactHandler).toBeTypeOf("function");
+    if (!compactHandler) return;
+    const messages = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user",
+      content: `Turn ${index}: analyst team-${index} recorded metric-${index} on 2026-05-${String(index + 1).padStart(2, "0")}, prefers policy-${index}, and reviewed src/module-${index}.ts.`,
+    }));
+    const started = performance.now();
+    const result = await compactHandler({
+      signal: new AbortController().signal,
+      preparation: {
+        messagesToSummarize: messages,
+        turnPrefixMessages: [],
+        fileOps: { read: new Set(["src/billing.ts"]), written: new Set(["config/rollout.yaml"]), edited: new Set() },
+        firstKeptEntryId: "entry-live",
+        tokensBefore: 2000,
+      },
+    } as never, {} as never);
+    const summary = result && typeof result === "object" && "compaction" in result
+      && result.compaction && typeof result.compaction === "object" && "summary" in result.compaction
+      ? result.compaction.summary
+      : undefined;
+    expect(summary).toBeTypeOf("string");
+    expect(performance.now() - started).toBeLessThan(30_000);
+  }, 30_000);
+}
+
+
+test("compaction accepts a delayed validated response", async () => {
+  const { handlers } = extensionStub();
+  const compactHandler = handlers.session_before_compact;
+  expect(compactHandler).toBeTypeOf("function");
+  if (!compactHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const delayed = Promise.withResolvers<Response>();
+  vi.useFakeTimers();
+  globalThis.fetch = (_url, init) => {
+    const timer = setTimeout(
+      () => delayed.resolve(new Response(JSON.stringify({ summary: "validated", validation_score: 0.9, compression_ratio: 0.2, probes: [] }))),
+      2_100,
+    );
+    init?.signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      delayed.reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+    return delayed.promise;
+  };
+  try {
+    const resultPromise = compactHandler({
+      signal: new AbortController().signal,
+      preparation: {
+        messagesToSummarize: [{ role: "user", content: "history" }],
+        turnPrefixMessages: [],
+        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 42,
+      },
+    } as never, {} as never);
+    vi.advanceTimersByTime(2_100);
+    expect(await resultPromise).toMatchObject({ compaction: { summary: "validated" } });
+  } finally {
+    globalThis.fetch = originalFetch;
+    vi.useRealTimers();
+  }
+});
+
+
+test("pre-aborted compaction returns native fallback without fetch", async () => {
+  const { handlers } = extensionStub();
+  const compactHandler = handlers.session_before_compact;
+  expect(compactHandler).toBeTypeOf("function");
+  if (!compactHandler) return;
+
+  const controller = new AbortController();
+  controller.abort();
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response("{}", { status: 200 });
+  };
+  try {
+    const result = await compactHandler({ signal: controller.signal, preparation: {} } as never, {} as never);
+    expect(result).toEqual({});
+    expect(calls).toBe(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("agent end enqueues only newly harvested transcript messages", async () => {
+  const { handlers } = extensionStub();
+  const agentEndHandler = handlers.agent_end;
+  expect(agentEndHandler).toBeTypeOf("function");
+  if (!agentEndHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const timers: Array<() => Promise<void>> = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return new Response("{}", { status: 200 });
+  };
+  const initial = {
+    messages: [
+      { role: "user", content: "Use Pro billing." },
+      { role: "assistant", content: "I will retain billing scope." },
+      { role: "assistant", content: "Existing billing record is stable." },
+      { role: "tool", content: "irrelevant tool plumbing" },
+    ],
+  };
+  const postCompaction = {
+    messages: [
+      { role: "compactionSummary", summary: "ACM summary: Pro billing scope retained." },
+      { role: "assistant", content: "I will retain billing scope." },
+      { role: "user", content: "Check new billing rollout." },
+    ],
+  };
+  const ctx = {
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "session-2" },
+    setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+  };
+  try {
+    await agentEndHandler(initial as never, ctx as never);
+    await agentEndHandler(postCompaction as never, ctx as never);
+    await agentEndHandler(postCompaction as never, ctx as never);
+    expect(timers).toHaveLength(2);
+    await timers[0]?.();
+    await timers[1]?.();
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({
+      url: "http://localhost:8927/ingest",
+      body: {
+        scope: "project:feat-acm-omp-extension",
+        source_ref: "session:session-2",
+        text: "user: Use Pro billing.\nassistant: I will retain billing scope.\nassistant: Existing billing record is stable.",
+      },
+    });
+    expect(requests[1]?.body.text).toBe("assistant: ACM summary: Pro billing scope retained.\nuser: Check new billing rollout.");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/acm last-compaction reports latest validated result", async () => {
+  const { handlers, commandHandlers } = extensionStub();
+  const compactHandler = handlers.session_before_compact;
+  const command = commandHandlers.acm;
+  expect(compactHandler).toBeTypeOf("function");
+  expect(command).toBeTypeOf("function");
+  if (!compactHandler || !command) return;
+
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    summary: "validated",
+    validation_score: 0.9,
+    compression_ratio: 0.2,
+    probes: [],
+  }));
+  try {
+    await compactHandler({
+      signal: new AbortController().signal,
+      preparation: {
+        messagesToSummarize: [{ role: "user", content: "history" }],
+        turnPrefixMessages: [],
+        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+      },
+    } as never, {} as never);
+    await command("last-compaction", { ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(notices).toEqual(["ACM last-compaction: score 0.90, ratio 0.20"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

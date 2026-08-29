@@ -1,13 +1,18 @@
 """Validated compaction and maintenance consolidation."""
 import json
+import re
+import os
 from typing import Any
 
 from . import db
+from .architect import DEFAULT_ARCHITECTURE
 from .entities import vector_literal
 from .llm import chat_json, tokens
 from .retrieve import scope_id
 
 VALIDATION_THRESHOLD = 0.80
+COMPACT_MAX_OUTPUT = int(os.environ.get("ACM_COMPACT_MAX_OUTPUT", "2048"))
+
 
 
 def _serialize(value: Any) -> str:
@@ -35,42 +40,114 @@ def _files(file_ops: dict[str, list[str]] | None) -> str:
     return "<files>\n" + "\n".join(rows) + "\n</files>"
 
 
-def _summary(task: str, material: str, budget_tokens: int, policy: str | None) -> str:
+def _summary(task: str, material: str, budget_tokens: int, policy: str | None) -> str | None:
     response = chat_json(
-        "Produce a faithful compact summary. Preserve explicit decisions, dates, preferences, and unresolved work.",
+        f"Produce a faithful compact summary in at most {budget_tokens} tokens. Preserve explicit decisions, dates, preferences, and unresolved work. "
+        "End with Exact validation evidence: one separate bullet for every reference_answer in Validation references and every Mandatory verbatim value. "
+        "Copy each bullet value character-for-character; never paraphrase or reorder it. Summarize repeated facts instead of listing them.",
         f"TASK: {task}\nBudget: {budget_tokens} tokens\nPolicy: {policy or 'preserve durable context'}\n\n{material}",
         '{"summary":"string"}',
+        max_tokens=min(budget_tokens, COMPACT_MAX_OUTPUT),
     )
     if response and isinstance(response.get("summary"), str) and response["summary"].strip():
         return response["summary"].strip()
-    return material[: budget_tokens * 4]
+    return None
 
 
-def _probes(material: str) -> list[str]:
+def _evidence(material: str) -> tuple[list[dict[str, str]], list[str]] | None:
+    categories = [
+        {"name": category["name"], "must_preserve_verbatim": category.get("must_preserve_verbatim", False)}
+        for category in DEFAULT_ARCHITECTURE["categories"]
+    ]
     response = chat_json(
-        "Write five to eight factual questions whose answers must survive compaction.",
-        f"TASK: probes\nFull input:\n{material}",
-        '{"probes":["string"]}',
+        "Generate exactly five distinct recoverability probes from full input: decisions first, then dates, entities, preferences, and files. "
+        "Each reference_answer must be an exact source substring under 40 characters. "
+        "List must_preserve_verbatim only for explicit decisions; use [] when none exist.",
+        f"TASK: probes\nArchitecture:\n{_serialize(categories)}\n\nFull input:\n{material}",
+        '{"probes":[{"question":"string","reference_answer":"string"}],"must_preserve_verbatim":["string"]}',
+        max_tokens=256,
     )
-    probes = response.get("probes") if response else None
-    if isinstance(probes, list):
-        probes = [probe for probe in probes if isinstance(probe, str) and probe.strip()]
-        if 5 <= len(probes) <= 8:
-            return probes
-    return ["What explicit decision must remain?" for _ in range(5)]
+    raw_pairs = response.get("probes") if response else None
+    raw_mandatory = response.get("must_preserve_verbatim") if response else None
+    if isinstance(raw_mandatory, str):
+        raw_mandatory = [raw_mandatory]
+    if not isinstance(raw_pairs, list) or not 5 <= len(raw_pairs) <= 8 or not isinstance(raw_mandatory, list):
+        return None
+    pairs = [
+        {"question": item["question"].strip(), "reference_answer": item["reference_answer"].strip()}
+        for item in raw_pairs
+        if isinstance(item, dict)
+        and isinstance(item.get("question"), str)
+        and item["question"].strip()
+        and isinstance(item.get("reference_answer"), str)
+        and item["reference_answer"].strip()
+    ]
+    mandatory = [item.strip() for item in raw_mandatory if isinstance(item, str) and item.strip()]
+    source = _normalized(material)
+    if any(_normalized(pair["reference_answer"]) not in source for pair in pairs) or any(
+        _normalized(item) not in source for item in mandatory
+    ):
+        return None
+    return (pairs, mandatory) if len(pairs) == len(raw_pairs) and len(mandatory) == len(raw_mandatory) else None
 
 
-def _validation(summary: str, probes: list[str]) -> float:
-    schema = '{"answers":[' + ",".join('{"answerable":true}' for _ in probes) + "]}"
-    response = chat_json(
-        "For each probe, say whether its answer is recoverable from the summary alone.",
-        f"TASK: validate\nSummary:\n{summary}\n\nProbes:\n{_serialize(probes)}",
-        schema,
+def _normalized(value: str) -> str:
+    return re.sub(r"\W+", "", value).casefold()
+
+
+def _file_paths(file_ops: dict[str, list[str]] | None) -> list[str]:
+    if not isinstance(file_ops, dict):
+        return []
+    return [
+        path
+        for key in ("read", "written", "edited")
+        for path in file_ops.get(key, [])
+        if isinstance(path, str) and "://" not in path
+    ]
+
+
+def _mandatory_values(verbatim: list[str], file_ops: dict[str, list[str]] | None) -> list[str]:
+    return list(dict.fromkeys([*verbatim, *_file_paths(file_ops)]))
+
+def _with_mandatory(summary: str, mandatory: list[str]) -> str:
+    missing = [value for value in mandatory if _normalized(value) not in _normalized(summary)]
+    return summary if not missing else f"{summary}\n\nExact mandatory evidence:\n" + "\n".join(f"- {value}" for value in missing)
+
+
+
+def _validation(summary: str, pairs: list[dict[str, str]], mandatory: list[str]) -> tuple[float, list[dict[str, str]]]:
+    answers_response = chat_json(
+        "Answer every probe using only the supplied summary. Do not use outside knowledge.",
+        f"TASK: summary-answers\nSummary:\n{summary}\n\nProbes:\n{_serialize([{'index': index, 'question': pair['question']} for index, pair in enumerate(pairs)])}",
+        _serialize({"answers": ["string"] * len(pairs)}),
+        max_tokens=256,
     )
-    answers = response.get("answers") if response else None
-    if not isinstance(answers, list) or not answers:
-        return 0.0
-    return sum(isinstance(answer, dict) and answer.get("answerable") is True for answer in answers[: len(probes)]) / len(probes)
+    answers = answers_response.get("answers") if answers_response else None
+    if not isinstance(answers, list) or len(answers) != len(pairs) or not all(isinstance(answer, str) for answer in answers):
+        return 0.0, [
+            {"question": pair["question"], "reference_answer": pair["reference_answer"], "summary_answer": "", "verdict": "wrong"}
+            for pair in pairs
+        ]
+    judge_response = chat_json(
+        "Compare each summary answer with its reference answer. Return correct, partial, or wrong only.",
+        f"TASK: judge\nEvidence:\n{_serialize([{**pair, 'summary_answer': answer} for pair, answer in zip(pairs, answers, strict=True)])}",
+        _serialize({"verdicts": ["correct|partial|wrong"] * len(pairs)}),
+        max_tokens=64,
+    )
+    verdicts = judge_response.get("verdicts") if judge_response else None
+    if not isinstance(verdicts, list) or len(verdicts) != len(pairs) or not all(verdict in {"correct", "partial", "wrong"} for verdict in verdicts):
+        return 0.0, [
+            {"question": pair["question"], "reference_answer": pair["reference_answer"], "summary_answer": answer, "verdict": "wrong"}
+            for pair, answer in zip(pairs, answers, strict=True)
+        ]
+    results = [
+        {"question": pair["question"], "reference_answer": pair["reference_answer"], "summary_answer": answer, "verdict": verdict}
+        for pair, answer, verdict in zip(pairs, answers, verdicts, strict=True)
+    ]
+    scores = {"correct": 1.0, "partial": 0.5, "wrong": 0.0}
+    if any(_normalized(value) not in _normalized(summary) for value in mandatory):
+        return 0.0, results
+    return sum(scores[result["verdict"]] for result in results) / len(results), results
 
 
 def compact(
@@ -80,10 +157,9 @@ def compact(
     previous_summary: str | None = None,
     custom_instructions: str | None = None,
     file_ops: dict[str, list[str]] | None = None,
-    previous_preserve_data: dict[str, Any] | None = None,
     policy: str | None = None,
 ) -> dict[str, Any]:
-    """Compact complete OMP preparation; opaque preserve data is carried by caller, never summarized."""
+    """Compact complete OMP preparation; opaque preserve data remains host-side."""
     files = _files(file_ops)
     history = _serialize(conversation)
     material = "\n\n".join(
@@ -99,26 +175,53 @@ def compact(
     full_input = "\n\n".join(
         part for part in (material, f"Turn prefix:\n{_serialize(turn_prefix)}" if turn_prefix else "") if part
     )
+    evidence = _evidence(full_input)
     final_summary = ""
-    probes: list[str] = []
+    probes: list[dict[str, str]] = []
     score = 0.0
     attempt_budget = budget_tokens
     summary_material = material
-    for _ in range(3):
-        history_summary = _summary("history", summary_material, attempt_budget, policy)
-        if turn_prefix:
-            prefix_summary = _summary(
-                "turn-prefix", f"History summary:\n{history_summary}\n\nTurn prefix:\n{_serialize(turn_prefix)}\n\n{files}", attempt_budget, policy
-            )
-            final_summary = f"{history_summary}\n---\n**Turn Context (split turn):**\n{prefix_summary}"
-        else:
-            final_summary = history_summary
-        probes = _probes(full_input)
-        score = _validation(final_summary, probes)
-        if score >= VALIDATION_THRESHOLD:
-            break
-        attempt_budget = int(attempt_budget * 1.5)
-        summary_material = f"{material}\n\nValidation probes that must be answerable from next summary:\n{_serialize(probes)}"
+    if evidence:
+        pairs, verbatim = evidence
+        mandatory = _mandatory_values(verbatim, file_ops)
+        summary_material = (
+            f"{material}\n\nValidation references to preserve:\n{_serialize(pairs)}"
+            f"\n\nMandatory verbatim values:\n{_serialize(mandatory)}"
+        )
+        retry_evidence = ""
+        for _ in range(3):
+            history_summary = _summary("history", summary_material, attempt_budget, policy)
+            if history_summary is None:
+                final_summary = material[: attempt_budget * 4]
+                break
+            if turn_prefix:
+                prefix_summary = _summary(
+                    "turn-prefix",
+                    f"History summary:\n{history_summary}\n\nTurn prefix:\n{_serialize(turn_prefix)}\n\n{files}{retry_evidence}",
+                    attempt_budget,
+                    policy,
+                )
+                if prefix_summary is None:
+                    final_summary = history_summary
+                    break
+                final_summary = f"{history_summary}\n---\n**Turn Context (split turn):**\n{prefix_summary}"
+            else:
+                final_summary = history_summary
+            final_summary = _with_mandatory(final_summary, mandatory)
+            score, probes = _validation(final_summary, pairs, mandatory)
+            if score >= VALIDATION_THRESHOLD:
+                break
+            failed = [
+                {"question": probe["question"], "reference_answer": probe["reference_answer"], "verdict": probe["verdict"]}
+                for probe in probes
+                if probe["verdict"] != "correct"
+            ]
+            if failed:
+                retry_evidence = f"\n\nFailed validation evidence to recover:\n{_serialize(failed)}"
+                summary_material += retry_evidence
+            attempt_budget = int(attempt_budget * 1.5)
+    else:
+        final_summary = _summary("history", summary_material, attempt_budget, policy) or material[: attempt_budget * 4]
     ratio = tokens(final_summary) / max(1, tokens(full_input))
     with db.connect() as conn:
         conn.execute(
