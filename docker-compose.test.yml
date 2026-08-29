@@ -1,0 +1,16 @@
+services:
+  pg:
+    ports: !override
+      - "127.0.0.1:5434:5432"
+    volumes: !override
+      - acm_test_pg:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+
+  acm-service:
+    ports: !override
+      - "127.0.0.1:8931:8927"
+    environment:
+      ACM_TEST_STACK: "1"
+
+volumes:
+  acm_test_pg:

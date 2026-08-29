@@ -91,15 +91,17 @@ It idempotently creates `project:browse-live` memory containing `Widget API key 
 ### Runbook
 
 ```bash
-# Service lifecycle proof.
-docker compose -p acm run --rm --no-deps \
-  -v "$PWD/service/tests:/app/tests:ro" \
-  -e ACM_TEST_BASE_URL=http://acm-service:8927 \
-  acm-service pytest tests/test_lifecycle.py -q
+# Full service suite. Fixtures exist only in disposable `acm-test`.
+test_compose=(docker compose -p acm-test -f docker-compose.yml -f docker-compose.test.yml)
+"${test_compose[@]}" up -d --build
+"${test_compose[@]}" run --rm --no-deps -v "$PWD/service/tests:/app/tests:ro" \
+  -e ACM_TEST_BASE_URL=http://acm-service:8927 acm-service pytest tests/ -q
+status=$?
+"${test_compose[@]}" down -v
+exit "$status"
 
-# Extension tests; second command invokes local ACM for real deadline proof.
-(cd extension && bun test extension.test.ts)
-(cd extension && ACM_LIVE_TEST=1 bun test extension.test.ts)
+# Extension unit/mocked tests.
+(cd extension && bun test)
 ```
 
 `/acm status` reports active mode, health, service stats, and session bundle/ingest counters. `/acm selfcheck` uses its own `project:acm-selfcheck-<session>` scope and `acm-selfcheck-<session>` bundle key, then prints endpoint pass/fail rows. `/acm inject on|off` toggles bundle injection for current runtime. `/acm last-compaction` shows latest validated hook result.
