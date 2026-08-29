@@ -46,3 +46,8 @@ def test_marked_test_stack_runs():
 
     assert result.returncode == 0, result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_service_image_omits_baked_tests():
+    """Fails if Dockerfile copies the test suite into the runtime image."""
+    assert not Path("/app/tests").exists()
