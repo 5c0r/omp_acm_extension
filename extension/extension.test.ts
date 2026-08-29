@@ -168,6 +168,105 @@ test("/acm status reports service health and stats", async () => {
   }
 });
 
+
+test("/acm browse prints scope summary without interactive UI", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const notices: string[] = [];
+  const urls: string[] = [];
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 2 } } }));
+  };
+  try {
+    await handler("browse", { hasUI: false, ui: { notify: (message: string) => notices.push(message) } } as never);
+    expect(urls).toEqual(["http://localhost:8927/api/ui/dashboard"]);
+    expect(notices).toEqual(["ACM browse (non-interactive):\nproject:browse-live (2)"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("/acm browse edits selected memory through native dialogs", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
+  const selections = ["project:browse-live", "#41 [fact] Widget API key rotates weekly", "Edit", "Done"];
+  const editor = vi.fn(async () => "Widget API key rotates monthly");
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+    return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates monthly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async () => selections.shift(),
+        editor,
+        notify: () => undefined,
+      },
+    } as never);
+    expect(editor).toHaveBeenCalledWith("Edit ACM memory #41", "Widget API key rotates weekly");
+    expect(requests).toContainEqual({
+      url: "http://localhost:8927/memories/41",
+      method: "PATCH",
+      body: { content: "Widget API key rotates monthly" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("/acm browse retains linked entities after a memory mutation", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body?: unknown }> = [];
+  const selections = ["project:browse-live", "#41 [fact] Widget API key rotates weekly", "Pin", "Add alias", "#9 widget", "Done"];
+  globalThis.fetch = async (url, init) => {
+    const address = String(url);
+    requests.push({ url: address, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    if (address.endsWith("/api/ui/memories/41")) return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [{ id: 9, canonical_name: "widget" }] }));
+    return new Response(JSON.stringify({ id: 41, kind: "fact", content: "Widget API key rotates weekly", scope: "project:browse-live", status: "active", importance: 0.8, pinned: true }));
+  };
+  try {
+    await handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async () => selections.shift(),
+        input: async () => "widget-live",
+        notify: () => undefined,
+      },
+    } as never);
+    expect(requests).toContainEqual({
+      url: "http://localhost:8927/entities/9/aliases",
+      method: "POST",
+      body: { alias: "widget-live" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("/acm selfcheck exercises every ACM endpoint", async () => {
   const { commandHandlers } = extensionStub();
   const handler = commandHandlers.acm;
