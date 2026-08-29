@@ -84,7 +84,7 @@ test("/acm status reports service health and stats", async () => {
   try {
     await handler("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
     expect(urls).toEqual(["http://localhost:8927/health", "http://localhost:8927/stats"]);
-    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=3; explicit_fetch=2"]);
+    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=3; explicit_fetch=2; session ✓0 ✗0; ingest 0"]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -182,14 +182,24 @@ test("/acm inject toggles runtime bundle injection", async () => {
 });
 
 test("tools route scoped requests to ACM endpoints", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
   const { tools } = extensionStub();
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; body?: Record<string, unknown> }> = [];
+  const setWidget = vi.fn();
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined });
-    return new Response(JSON.stringify({ ok: true }));
+    return new Response(JSON.stringify(String(url).endsWith("/compact")
+      ? { summary: "validated", validation_score: 0.9, compression_ratio: 0.2, probes: [] }
+      : { ok: true }));
   };
-  const context = { cwd: "/tmp/acm-tools", sessionManager: { getSessionId: () => "session-3" } };
+  const context = {
+    cwd: "/tmp/acm-tools",
+    hasUI: true,
+    sessionManager: { getSessionId: () => "session-3" },
+    ui: { setWidget },
+  };
   const invoke = async (name: string, params: Record<string, unknown>) => {
     const tool = tools.find(candidate => candidate.name === name);
     expect(tool).toBeDefined();
@@ -221,8 +231,15 @@ test("tools route scoped requests to ACM endpoints", async () => {
       { url: "http://localhost:8927/status/7", body: undefined },
       { url: "http://localhost:8927/consolidate", body: { scope: "project:shared" } },
     ]);
+    expect(setWidget).toHaveBeenCalledWith(
+      "acm",
+      ["ACM full · bundle ✓0 ✗0 · ingest 0 · last compact 0.90/0.20"],
+      { placement: "belowEditor" },
+    );
   } finally {
     globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
   }
 });
 
@@ -322,6 +339,10 @@ test("auto arm gate fires once for a threshold crossing", () => {
 });
 
 test("armed compaction match keeps unrelated preserve data but discards stale payloads", async () => {
+  const originalMode = process.env.ACM_MODE;
+  process.env.ACM_MODE = "compaction";
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
   const { handlers } = extensionStub();
   const compactHandler = handlers.session_before_compact;
 
@@ -330,6 +351,7 @@ test("armed compaction match keeps unrelated preserve data but discards stale pa
 
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const setWidget = vi.fn();
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), body: JSON.parse(String(init?.body)) });
     return new Response(
@@ -352,7 +374,11 @@ test("armed compaction match keeps unrelated preserve data but discards stale pa
           tokensBefore: 42,
         },
       },
-      { cwd: process.cwd() },
+      {
+        cwd: process.cwd(),
+        hasUI: true,
+        ui: { setWidget },
+      } as never,
     );
 
     expect(requests).toEqual([
@@ -385,19 +411,31 @@ test("armed compaction match keeps unrelated preserve data but discards stale pa
         },
       },
     });
+    expect(setWidget).toHaveBeenCalledWith(
+      "acm",
+      ["ACM compaction · bundle — · ingest 0 · last compact 0.90/0.20"],
+      { placement: "belowEditor" },
+    );
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
   }
 });
 
 
 test("context prepends only a ready session bundle", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
   const { handlers } = extensionStub();
   const contextHandler = handlers.context;
   expect(contextHandler).toBeTypeOf("function");
   if (!contextHandler) return;
 
   const originalFetch = globalThis.fetch;
+  const setWidget = vi.fn();
   const urls: string[] = [];
   globalThis.fetch = async url => {
     urls.push(String(url));
@@ -406,7 +444,11 @@ test("context prepends only a ready session bundle", async () => {
   try {
     const result = await contextHandler(
       { messages: [{ role: "user", content: "live question" }] } as never,
-      { sessionManager: { getSessionId: () => "session-1" } } as never,
+      {
+        hasUI: true,
+        sessionManager: { getSessionId: () => "session-1" },
+        ui: { setWidget },
+      } as never,
     );
     expect(urls).toEqual(["http://localhost:8927/bundle/session-1"]);
     expect(result).toEqual({
@@ -415,8 +457,140 @@ test("context prepends only a ready session bundle", async () => {
         { role: "user", content: "live question" },
       ],
     });
+    expect(setWidget).toHaveBeenCalledWith(
+      "acm",
+      ["ACM full · bundle ✓1 ✗0 · ingest 0 · last compact —"],
+      { placement: "belowEditor" },
+    );
   } finally {
     globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
+test("context records a widget miss when bundle is unavailable", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { handlers } = extensionStub();
+  const contextHandler = handlers.context;
+  expect(contextHandler).toBeTypeOf("function");
+  if (!contextHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const setWidget = vi.fn();
+  globalThis.fetch = async () => new Response(null, { status: 404 });
+  try {
+    await contextHandler(
+      { messages: [{ role: "user", content: "unbundled question" }] } as never,
+      {
+        hasUI: true,
+        sessionManager: { getSessionId: () => "session-miss" },
+        ui: { setWidget },
+      } as never,
+    );
+    expect(setWidget).toHaveBeenCalledWith(
+      "acm",
+      ["ACM full · bundle ✓0 ✗1 · ingest 0 · last compact —"],
+      { placement: "belowEditor" },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
+test("ACM_WIDGET=0 disables the status widget", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  process.env.ACM_WIDGET = "0";
+  const { handlers } = extensionStub();
+  const contextHandler = handlers.context;
+  expect(contextHandler).toBeTypeOf("function");
+  if (!contextHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const setWidget = vi.fn();
+  globalThis.fetch = async () => new Response(JSON.stringify({ rendered: "[acm memory] enabled" }), { status: 200 });
+  try {
+    const result = await contextHandler(
+      { messages: [{ role: "user", content: "keep injecting" }] } as never,
+      {
+        hasUI: true,
+        sessionManager: { getSessionId: () => "session-disabled" },
+        ui: { setWidget },
+      } as never,
+    );
+    expect(result).toEqual({
+      messages: [
+        { role: "user", content: "[acm memory] enabled" },
+        { role: "user", content: "keep injecting" },
+      ],
+    });
+    expect(setWidget).not.toHaveBeenCalled();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
+test("widget failure leaves context injection intact", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { handlers } = extensionStub();
+  const contextHandler = handlers.context;
+  expect(contextHandler).toBeTypeOf("function");
+  if (!contextHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ rendered: "[acm memory] preserved" }), { status: 200 });
+  try {
+    await expect(contextHandler(
+      { messages: [{ role: "user", content: "survive TUI failure" }] } as never,
+      {
+        hasUI: true,
+        sessionManager: { getSessionId: () => "session-throw" },
+        ui: { setWidget: () => { throw new Error("TUI unavailable"); } },
+      } as never,
+    )).resolves.toEqual({
+      messages: [
+        { role: "user", content: "[acm memory] preserved" },
+        { role: "user", content: "survive TUI failure" },
+      ],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
+test("headless context injection skips the status widget", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { handlers } = extensionStub();
+  const contextHandler = handlers.context;
+  expect(contextHandler).toBeTypeOf("function");
+  if (!contextHandler) return;
+
+  const originalFetch = globalThis.fetch;
+  const setWidget = vi.fn();
+  globalThis.fetch = async () => new Response(JSON.stringify({ rendered: "[acm memory] headless" }), { status: 200 });
+  try {
+    await contextHandler(
+      { messages: [{ role: "user", content: "headless turn" }] } as never,
+      {
+        hasUI: false,
+        sessionManager: { getSessionId: () => "session-headless" },
+        ui: { setWidget },
+      } as never,
+    );
+    expect(setWidget).not.toHaveBeenCalled();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
   }
 });
 
@@ -567,6 +741,8 @@ test("missing armed compaction falls through to native", async () => {
 });
 
 test("agent end enqueues only newly harvested transcript messages", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
   const { handlers } = extensionStub();
   const agentEndHandler = handlers.agent_end;
   expect(agentEndHandler).toBeTypeOf("function");
@@ -575,6 +751,7 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
   const timers: Array<() => Promise<void>> = [];
+  const setWidget = vi.fn();
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), body: JSON.parse(String(init?.body)) });
     return new Response("{}", { status: 200 });
@@ -596,8 +773,10 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
   };
   const ctx = {
     cwd: process.cwd(),
+    hasUI: true,
     sessionManager: { getSessionId: () => "session-2" },
     setTimeout: (callback: () => Promise<void>) => timers.push(callback),
+    ui: { setWidget },
   };
   try {
     await agentEndHandler(initial as never, ctx as never);
@@ -616,8 +795,23 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
       },
     });
     expect(requests[1]?.body.text).toBe("assistant: ACM summary: Pro billing scope retained.\nuser: Check new billing rollout.");
+    expect(setWidget).toHaveBeenCalledTimes(2);
+    expect(setWidget).toHaveBeenNthCalledWith(
+      1,
+      "acm",
+      ["ACM full · bundle ✓0 ✗0 · ingest 3 · last compact —"],
+      { placement: "belowEditor" },
+    );
+    expect(setWidget).toHaveBeenNthCalledWith(
+      2,
+      "acm",
+      ["ACM full · bundle ✓0 ✗0 · ingest 5 · last compact —"],
+      { placement: "belowEditor" },
+    );
   } finally {
     globalThis.fetch = originalFetch;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
   }
 });
 
@@ -664,7 +858,7 @@ test("--acm-mode selects memory when ACM_MODE is unset", async () => {
   globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
   try {
     await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
-    expect(notices).toEqual(["ACM status: ok; mode=memory; bundle_injected=0; explicit_fetch=0"]);
+    expect(notices).toEqual(["ACM status: ok; mode=memory; bundle_injected=0; explicit_fetch=0; session ✓0 ✗0; ingest 0"]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;
@@ -683,7 +877,7 @@ test("ACM_MODE overrides --acm-mode", async () => {
   globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
   try {
     await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
-    expect(notices).toEqual(["ACM status: ok; mode=compaction; bundle_injected=0; explicit_fetch=0"]);
+    expect(notices).toEqual(["ACM status: ok; mode=compaction; bundle_injected=0; explicit_fetch=0; session ✓0 ✗0; ingest 0"]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;
@@ -703,7 +897,7 @@ test("unknown ACM_MODE warns once and falls back to full", async () => {
     expect(warnings).toEqual([]);
     await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
     expect(warnings).toEqual(["ACM mode 'not-a-mode' unknown; falling back to 'full' (expected full | memory | compaction)"]);
-    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=0; explicit_fetch=0"]);
+    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=0; explicit_fetch=0; session ✓0 ✗0; ingest 0"]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;

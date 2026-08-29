@@ -40,7 +40,7 @@ ln -s /Users/tri.nguyen/Projekti/petty/acm-worktrees/feat-acm-omp-extension/exte
   ~/.omp/agent/extensions/acm
 ```
 
-`/acm status` reports active mode, health, and stats. `/acm selfcheck` uses its own `project:acm-selfcheck-<session>` scope and `acm-selfcheck-<session>` bundle key, then prints endpoint pass/fail rows. `/acm inject on|off` toggles bundle injection for current runtime. `/acm last-compaction` shows latest validated hook result.
+`/acm status` reports active mode, health, service stats, and session bundle/ingest counters. `/acm selfcheck` uses its own `project:acm-selfcheck-<session>` scope and `acm-selfcheck-<session>` bundle key, then prints endpoint pass/fail rows. `/acm inject on|off` toggles bundle injection for current runtime. `/acm last-compaction` shows latest validated hook result. Interactive sessions show `ACM full · bundle ✓12 ✗3 · ingest 45 · last compact 0.87/0.21` below editor.
 
 Disable extension through OMP settings:
 
@@ -59,6 +59,10 @@ Select a preset at OMP startup with `omp --acm-mode=<mode>` or `ACM_MODE=<mode> 
 | `compaction` | Off | Off | On |
 
 `ACM_AUTO_INJECT=0` and `ACM_AUTO_ARM` retain their existing granular behavior inside applicable presets. `acm_compact` remains available in every preset.
+
+| Environment | Default | Effect |
+|---|---|---|
+| `ACM_WIDGET` | on | Set `0` to disable the interactive status widget. |
 
 OMP extensions cannot read arbitrary `config.yml` keys; use flag or env until OMP core exposes extension settings. `compaction` leaves memory ownership to Hindsight/Mnemopi; no Hindsight-to-ACM bridge exists.
 

@@ -114,6 +114,25 @@ function toolResult(response: unknown) {
 
 
 
+
+
+export type WidgetState = {
+  mode: AcmMode;
+  bundleHits: number;
+  bundleMisses: number;
+  ingestCount: number;
+  lastCompaction?: CompactResponse;
+};
+
+export function renderWidget(state: WidgetState): string[] {
+  const bundle = state.mode === "compaction" ? "—" : `✓${state.bundleHits} ✗${state.bundleMisses}`;
+  const compact = state.lastCompaction
+    ? `${state.lastCompaction.validation_score.toFixed(2)}/${state.lastCompaction.compression_ratio.toFixed(2)}`
+    : "—";
+  return [`ACM ${state.mode} · bundle ${bundle} · ingest ${state.ingestCount} · last compact ${compact}`];
+}
+
+
 export default function acmExtension(pi: ExtensionAPI) {
   pi.setLabel("Agentic Context Management");
   pi.registerFlag("acm-mode", { description: "ACM subsystem preset: full | memory | compaction", type: "string" });
@@ -124,6 +143,19 @@ export default function acmExtension(pi: ExtensionAPI) {
   let autoInject = process.env.ACM_AUTO_INJECT !== "0";
   const autoArmEnabled = process.env.ACM_AUTO_ARM === "1";
   let lastCompaction: CompactResponse | undefined;
+  const autoWidget = process.env.ACM_WIDGET !== "0";
+  let bundleHits = 0;
+  let bundleMisses = 0;
+  let ingestCount = 0;
+  const updateWidget = (ctx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[], options?: { placement?: "belowEditor" }) => void } }) => {
+    if (!autoWidget || !ctx.hasUI) return;
+    const [line] = renderWidget({ mode: getMode().mode, bundleHits, bundleMisses, ingestCount, lastCompaction });
+    try {
+      ctx.ui.setWidget("acm", [line], { placement: "belowEditor" });
+    } catch {
+      // ponytail: widget is cosmetic — a failing UI surface must never break the handler
+    }
+  };
   const z = pi.zod;
 
   pi.registerTool({
@@ -170,7 +202,7 @@ export default function acmExtension(pi: ExtensionAPI) {
       }).optional(),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      return toolResult(await acmRequest("/compact", "POST", {
+      const response = await acmRequest<CompactResponse>("/compact", "POST", {
         scope: projectScope(ctx.cwd),
         conversation: [{ role: "user", content: params.conversation }],
         budget_tokens: params.budget_tokens ?? 1500,
@@ -178,7 +210,12 @@ export default function acmExtension(pi: ExtensionAPI) {
         turn_prefix: params.turn_prefix ? [{ role: "user", content: params.turn_prefix }] : undefined,
         file_ops: params.file_ops,
         custom_instructions: params.custom_instructions,
-      }, signal));
+      }, signal);
+      if (response?.validation_score >= 0.8) {
+        lastCompaction = response;
+        updateWidget(ctx);
+      }
+      return toolResult(response);
     },
   });
   pi.registerTool({
@@ -224,7 +261,7 @@ export default function acmExtension(pi: ExtensionAPI) {
           acmRequest<{ stats?: Record<string, unknown> }>("/stats"),
         ]);
         const values = stats?.stats ?? {};
-        ctx.ui.notify(`ACM status: ${health?.status ?? "unavailable"}; mode=${mode.mode}; bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}`, "info");
+        ctx.ui.notify(`ACM status: ${health?.status ?? "unavailable"}; mode=${mode.mode}; bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}; session ✓${bundleHits} ✗${bundleMisses}; ingest ${ingestCount}`, "info");
         return;
       }
       if (command === "selfcheck") {
@@ -296,6 +333,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     }, event.signal);
     if (!response || response.validation_score < 0.8) return {};
     lastCompaction = response;
+    updateWidget(ctx);
     return {
       compaction: {
         summary: response.summary,
@@ -352,6 +390,8 @@ export default function acmExtension(pi: ExtensionAPI) {
     });
     if (!additions.length) return;
     harvested.set(sessionId, seen);
+    ingestCount += additions.length;
+    updateWidget(ctx);
     const transcript = additions.map(message => `${message.role}: ${message.content}`).join("\n");
     ctx.setTimeout(
       async () => {
@@ -371,7 +411,13 @@ export default function acmExtension(pi: ExtensionAPI) {
     if (user) latestUser.set(sessionId, user.content);
     if (!getMode().anticipate || !autoInject) return {};
     const bundle = await acmRequest<{ rendered?: unknown }>(`/bundle/${sessionId}`);
-    if (typeof bundle?.rendered !== "string" || !bundle.rendered.trim()) return {};
+    if (typeof bundle?.rendered !== "string" || !bundle.rendered.trim()) {
+      bundleMisses += 1;
+      updateWidget(ctx);
+      return {};
+    }
+    bundleHits += 1;
+    updateWidget(ctx);
     return { messages: [{ role: "user", content: bundle.rendered }, ...event.messages] };
   });
 }
