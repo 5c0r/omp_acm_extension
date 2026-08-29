@@ -94,6 +94,7 @@ It idempotently creates `project:browse-live` memory containing `Widget API key 
 # Full service suite. Runtime image has no tests; mount them only into disposable `acm-test`.
 test_compose=(docker compose -p acm-test -f docker-compose.yml -f docker-compose.test.yml)
 "${test_compose[@]}" up -d --build
+"${test_compose[@]}" run --rm --no-deps acm-service sh -ec 'test ! -e /app/tests'
 "${test_compose[@]}" run --rm --no-deps -v "$PWD/service/tests:/app/tests:ro" \
   -e ACM_TEST_BASE_URL=http://acm-service:8927 acm-service pytest tests/ -q
 status=$?

@@ -46,9 +46,3 @@ def test_marked_test_stack_runs():
 
     assert result.returncode == 0, result.stderr
     assert "1 passed" in result.stdout
-
-
-def test_service_image_omits_baked_tests():
-    """Fails only when tests share the runtime image filesystem."""
-    tests = Path("/app/tests")
-    assert not tests.exists() or tests.stat().st_dev != Path("/app").stat().st_dev
