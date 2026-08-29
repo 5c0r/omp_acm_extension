@@ -905,6 +905,48 @@ test("unknown ACM_MODE warns once and falls back to full", async () => {
   }
 });
 
+test("compaction context renders the widget without fetching a bundle", async () => {
+  const originalMode = process.env.ACM_MODE;
+  process.env.ACM_MODE = "compaction";
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { handlers } = extensionStub();
+  const context = handlers.context;
+  expect(context).toBeTypeOf("function");
+  if (!context) return;
+
+  const originalFetch = globalThis.fetch;
+  const urls: string[] = [];
+  const setWidget = vi.fn();
+  globalThis.fetch = async url => {
+    urls.push(String(url));
+    return new Response("{}");
+  };
+  try {
+    const result = await context(
+      { messages: [{ role: "user", content: "compaction-only session" }] } as never,
+      {
+        hasUI: true,
+        sessionManager: { getSessionId: () => "compaction-widget" },
+        ui: { setWidget },
+      } as never,
+    );
+    expect(result).toEqual({});
+    expect(urls).toEqual([]);
+    expect(setWidget).toHaveBeenCalledWith(
+      "acm",
+      ["ACM compaction · bundle — · ingest 0 · last compact —"],
+      { placement: "belowEditor" },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.ACM_MODE;
+    else process.env.ACM_MODE = originalMode;
+    if (previousWidget === undefined) delete process.env.ACM_WIDGET;
+    else process.env.ACM_WIDGET = previousWidget;
+  }
+});
+
 test("compaction mode disables automatic ingestion, anticipation, and injection but retains compact hook", async () => {
   const originalMode = process.env.ACM_MODE;
   process.env.ACM_MODE = "compaction";

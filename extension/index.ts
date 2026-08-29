@@ -147,11 +147,14 @@ export default function acmExtension(pi: ExtensionAPI) {
   let bundleHits = 0;
   let bundleMisses = 0;
   let ingestCount = 0;
+  let lastWidgetLine: string | undefined;
   const updateWidget = (ctx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[], options?: { placement?: "belowEditor" }) => void } }) => {
     if (!autoWidget || !ctx.hasUI) return;
     const [line] = renderWidget({ mode: getMode().mode, bundleHits, bundleMisses, ingestCount, lastCompaction });
+    if (line === lastWidgetLine) return;
     try {
       ctx.ui.setWidget("acm", [line], { placement: "belowEditor" });
+      lastWidgetLine = line;
     } catch {
       // ponytail: widget is cosmetic — a failing UI surface must never break the handler
     }
@@ -409,7 +412,11 @@ export default function acmExtension(pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     const user = messages(event.messages).reverse().find(message => message.role === "user");
     if (user) latestUser.set(sessionId, user.content);
-    if (!getMode().anticipate || !autoInject) return {};
+    const mode = getMode();
+    if (!mode.anticipate || !autoInject) {
+      updateWidget(ctx);
+      return {};
+    }
     const bundle = await acmRequest<{ rendered?: unknown }>(`/bundle/${sessionId}`);
     if (typeof bundle?.rendered !== "string" || !bundle.rendered.trim()) {
       bundleMisses += 1;
