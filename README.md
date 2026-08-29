@@ -42,6 +42,7 @@ Interactive sessions show status below editor: mode, bundle hits/misses, harvest
 | Anticipation | Best-effort async cache; a missing/expired bundle injects nothing. | Need guaranteed recall -> use explicit `acm_fetch`. |
 | Compaction | Automatic validated compaction is off (`ACM_AUTO_ARM=0`): public `turn_end` lacks native preparation's dynamic cut point, turn prefix, and file ops. Hook only reads an exact canonical-digest match; any miss falls through native. | Live OMP proves an automatic threshold compaction matches an armed digest -> enable arming; otherwise use explicit `acm_compact`. |
 | Selfcheck | Intentionally writes only synthetic scope/bundle; may wait up to about one minute for async bundle. | Need non-mutating probe -> add service-owned health/readiness route. |
+| Schema init | Each service process holds a Postgres advisory lock while reapplying additive `IF NOT EXISTS` DDL; no migration history or destructive DDL. | Startup contention or a non-additive migration -> introduce a versioned migration runner. |
 
 ## Install
 
@@ -70,6 +71,22 @@ ln -s "$(pwd)/extension" "$HOME/.omp/agent/extensions/acm"
 ```
 
 Start a fresh `omp` session. Footer should show `ACM <mode> · connected`; run `/acm selfcheck` until every row is `PASS`, then run `/acm status`.
+
+### Memory UI
+
+Open [http://127.0.0.1:8927/ui/](http://127.0.0.1:8927/ui/) for local memory operations. Dashboard is default: counts by kind/status/scope, bundle hit/miss, ingest outcomes, compaction validation history, and top-used memories. Browse filters by exact scope, kind, status, and text; a memory detail shows content, importance, temporal validity, provenance, entities, and its usage drill-down.
+
+Detail actions edit content, archive/restore, merge into a same-scope memory, pin/unpin, set importance, and add/remove entity aliases. Archive is recoverable: ACM has no hard-delete UI action.
+
+`/acm browse` provides same flow in OMP: select scope, select memory, inspect detail, then manage it through native dialogs. Non-interactive OMP sessions print scope summary only.
+
+For a repeatable local roundtrip, seed the browse demo once or repeatedly:
+
+```bash
+curl -X POST http://127.0.0.1:8927/api/ui/seed-demo
+```
+
+It idempotently creates `project:browse-live` memory containing `Widget API key rotates weekly`.
 
 ### Runbook
 
