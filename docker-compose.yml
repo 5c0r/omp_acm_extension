@@ -1,0 +1,41 @@
+services:
+  pg:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: acm
+      POSTGRES_PASSWORD: acm
+      POSTGRES_DB: acm
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - acm_pg:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acm -d acm"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  acm-service:
+    build: ./service
+    environment:
+      ACM_PG_DSN: postgresql://acm:acm@pg:5432/acm
+      # ponytail: reuse the host's native ollama; containerized ollama only if isolation ever demands it
+      ACM_OLLAMA_URL: http://host.docker.internal:11434
+      ACM_EMBED_MODEL: qwen3-embedding:0.6b
+      ACM_CHAT_MODEL: qwen3:4b
+    ports:
+      - "127.0.0.1:8927:8927"
+    depends_on:
+      pg:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8927/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  acm_pg:

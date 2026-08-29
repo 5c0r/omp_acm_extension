@@ -1,0 +1,20 @@
+[project]
+name = "acm-service"
+version = "0.1.0"
+description = "Agentic Context Management service (arXiv 2607.21503) for oh-my-pi"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "psycopg[binary]>=3.2",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["acm"]
+
+[tool.setuptools.package-dir]
+acm = "acm"
