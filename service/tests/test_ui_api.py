@@ -320,3 +320,39 @@ def test_decision_merge_preserves_source_block_verbatim() -> None:
         merged = client.post(f"/memories/{source['id']}/merge", json={"target_id": target_id})
         assert merged.status_code == 200
         assert source_content in merged.json()["content"]
+
+
+def test_memory_console_serves_index() -> None:
+    with TestClient(app) as client:
+        response = client.get("/ui/")
+
+    assert response.status_code == 200
+    assert "<title>ACM Memory Console</title>" in response.text
+
+
+def test_demo_seed_is_idempotent() -> None:
+    with TestClient(app) as client:
+        first = client.post("/api/ui/seed-demo")
+        second = client.post("/api/ui/seed-demo")
+        memories = client.get("/api/ui/memories", params={"scope": "project:browse-live", "q": "Widget API key rotates weekly"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["memory_id"] == second.json()["memory_id"]
+    assert len(memories.json()["items"]) == 1
+    assert "Widget API key rotates weekly" in memories.json()["items"][0]["content"]
+
+
+def test_entity_alias_can_be_removed() -> None:
+    scope_id = _scope_id(_scope())
+    with db.connect() as conn:
+        entity = conn.execute(
+            "INSERT INTO entity (scope_id, canonical_name, aliases) VALUES (%s, 'widget', ARRAY['legacy-widget']) RETURNING id",
+            (scope_id,),
+        ).fetchone()
+
+    with TestClient(app) as client:
+        response = client.request("DELETE", f"/entities/{entity['id']}/aliases", json={"alias": "legacy-widget"})
+
+    assert response.status_code == 200
+    assert response.json()["aliases"] == []

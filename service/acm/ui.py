@@ -218,6 +218,48 @@ def add_entity_alias(entity_id: int, request: AliasRequest) -> dict[str, Any]:
     return entity
 
 
+@manage_router.delete("/entities/{entity_id}/aliases")
+def remove_entity_alias(entity_id: int, request: AliasRequest) -> dict[str, Any]:
+    alias = sanitize(request.alias)
+    if not alias:
+        raise HTTPException(status_code=400, detail="alias is required")
+    with db.connect() as conn:
+        entity = conn.execute("SELECT id, canonical_name, aliases FROM entity WHERE id = %s FOR UPDATE", (entity_id,)).fetchone()
+        if not entity:
+            raise HTTPException(status_code=404, detail="entity not found")
+        aliases = [existing for existing in entity["aliases"] if existing.casefold() != alias.casefold()]
+        if len(aliases) != len(entity["aliases"]):
+            entity = conn.execute("UPDATE entity SET aliases = %s WHERE id = %s RETURNING id, canonical_name, aliases", (aliases, entity_id)).fetchone()
+    return entity
+
+
+_DEMO_SCOPE = "browse-live"
+_DEMO_CONTENT = "Widget API key rotates weekly; regenerate it through the internal secrets console every Monday."
+_DEMO_SEED_LOCK = 8_465_415
+
+
+@ui_router.post("/seed-demo")
+def seed_demo() -> dict[str, Any]:
+    embedding = _embedding_literal(_DEMO_CONTENT)
+    scope_id = db.get_or_create_scope("project", _DEMO_SCOPE)
+    with db.connect() as conn, conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_DEMO_SEED_LOCK,))
+        memory = conn.execute(
+            "SELECT id FROM memory WHERE scope_id = %s AND content = %s",
+            (scope_id, _DEMO_CONTENT),
+        ).fetchone()
+        if not memory:
+            memory = conn.execute(
+                "INSERT INTO memory (scope_id, kind, content, importance, source_ref, embedding) "
+                "VALUES (%s, 'fact', %s, 0.8, 'seed:browse-live', %s::vector) RETURNING id",
+                (scope_id, _DEMO_CONTENT, embedding),
+            ).fetchone()
+            created = True
+        else:
+            created = False
+    return {"memory_id": memory["id"], "created": created}
+
+
 @ui_router.get("/memories")
 def browse_memories(
     scope: str | None = None,

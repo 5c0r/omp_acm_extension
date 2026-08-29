@@ -1,9 +1,11 @@
 """FastAPI boundary for ACM lifecycle primitives."""
 from contextlib import asynccontextmanager
+from pathlib import Path
 import threading
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response, status
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
@@ -26,6 +28,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="ACM service", lifespan=lifespan)
 app.include_router(manage_router)
 app.include_router(ui_router)
+app.mount("/ui", StaticFiles(directory=Path(__file__).with_name("web"), html=True), name="ui")
 
 
 

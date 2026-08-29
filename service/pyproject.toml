@@ -19,3 +19,6 @@ packages = ["acm"]
 
 [tool.setuptools.package-dir]
 acm = "acm"
+
+[tool.setuptools.package-data]
+acm = ["web/*"]
