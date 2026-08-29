@@ -5,16 +5,18 @@ import os
 import queue
 import re
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import db
-from .architect import DEFAULT_ARCHITECTURE
+from .architect import DEFAULT_ARCHITECTURE, load_architecture
 from .entities import vector_literal
 from .llm import chat_json, tokens
 from .retrieve import scope_id
 
 VALIDATION_THRESHOLD = 0.80
 COMPACT_MAX_OUTPUT = int(os.environ.get("ACM_COMPACT_MAX_OUTPUT", "2048"))
+ARMED_TTL = timedelta(minutes=10)
 
 _armed_jobs: queue.Queue[tuple[Any, ...]] = queue.Queue()
 _armed_worker: threading.Thread | None = None
@@ -38,12 +40,21 @@ def _canonical_file_ops(file_ops: dict[str, list[str]] | None) -> dict[str, list
     return {key: sorted(value) for key, value in sorted(file_ops.items())}
 
 
+def architecture_digest(architecture: dict[str, Any]) -> str:
+    canonical = json.dumps(architecture, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def compaction_digest(
     conversation: list[dict[str, Any]],
     turn_prefix: list[dict[str, Any]] | None = None,
     previous_summary: str | None = None,
     file_ops: dict[str, list[str]] | None = None,
     custom_instructions: str | None = None,
+    architecture: dict[str, Any] | None = None,
+    resolved_scope_id: int | None = None,
+    supplemental_policy: str | None = None,
+    budget_tokens: int = 1500,
 ) -> str:
     payload = {
         "conversation": _canonical_messages(conversation),
@@ -51,6 +62,10 @@ def compaction_digest(
         "previous_summary": previous_summary,
         "file_ops": _canonical_file_ops(file_ops),
         "custom_instructions": custom_instructions,
+        "architecture_sha256": architecture_digest(architecture or DEFAULT_ARCHITECTURE),
+        "scope_id": resolved_scope_id,
+        "supplemental_policy": supplemental_policy,
+        "budget_tokens": budget_tokens,
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
@@ -90,18 +105,24 @@ def _summary(task: str, material: str, budget_tokens: int, policy: str | None) -
     return None
 
 
-def _evidence(material: str) -> tuple[list[dict[str, str]], list[str]] | None:
+def _evidence(
+    material: str,
+    architecture: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, str]], list[str]] | None:
     categories = [
         {"name": category["name"], "must_preserve_verbatim": category.get("must_preserve_verbatim", False)}
-        for category in DEFAULT_ARCHITECTURE["categories"]
+        for category in (architecture or DEFAULT_ARCHITECTURE)["categories"]
     ]
+    verbatim_categories = [category["name"] for category in categories if category["must_preserve_verbatim"]]
     response = chat_json(
-        "Generate exactly five distinct recoverability probes from full input: decisions first, then dates, entities, preferences, and files. "
+        "Generate exactly five distinct recoverability probes from full input. "
+        f"Probe these must-preserve categories first: {', '.join(verbatim_categories) or 'none'}. "
+        "Then cover decisions, dates, entities, preferences, and files. "
         "Each reference_answer must be an exact source substring under 40 characters. "
-        "List must_preserve_verbatim only for explicit decisions; use [] when none exist.",
+        "List must_preserve_verbatim values from the must-preserve categories only; use [] when none exist.",
         f"TASK: probes\nArchitecture:\n{_serialize(categories)}\n\nFull input:\n{material}",
         '{"probes":[{"question":"string","reference_answer":"string"}],"must_preserve_verbatim":["string"]}',
-        max_tokens=256,
+        max_tokens=512,
     )
     raw_pairs = response.get("probes") if response else None
     raw_mandatory = response.get("must_preserve_verbatim") if response else None
@@ -198,8 +219,12 @@ def compact(
     from_extension: bool = False,
     compaction_id: int | None = None,
     digest: str | None = None,
+    architecture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compact complete OMP preparation; opaque preserve data remains host-side."""
+    current_scope = scope_id(scope) if scope else None
+    architecture = architecture or load_architecture(current_scope)
+    supplemental_policy = policy
+    policy = "\n\n".join(part for part in (architecture["compaction_policy"], supplemental_policy) if part)
     files = _files(file_ops)
     history = _serialize(conversation)
     material = "\n\n".join(
@@ -215,7 +240,7 @@ def compact(
     full_input = "\n\n".join(
         part for part in (material, f"Turn prefix:\n{_serialize(turn_prefix)}" if turn_prefix else "") if part
     )
-    evidence = _evidence(full_input)
+    evidence = _evidence(full_input, architecture)
     final_summary = ""
     probes: list[dict[str, str]] = []
     score = 0.0
@@ -267,11 +292,10 @@ def compact(
     db.ensure_schema()
     with db.connect() as conn:
         if compaction_id is None:
-            current_scope = scope_id(scope) if scope else None
             conn.execute(
                 "INSERT INTO compaction (scope_id, summary, validation_score, compression_ratio, digest, status, probes, from_extension) "
                 "VALUES (%s, %s, %s, %s, %s, 'done', %s::jsonb, %s)",
-                (current_scope, final_summary, score, ratio, digest or compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions), json.dumps(probes), from_extension),
+                (current_scope, final_summary, score, ratio, digest or compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions, architecture, current_scope, supplemental_policy, budget_tokens), json.dumps(probes), from_extension),
             )
         else:
             conn.execute(
@@ -310,15 +334,36 @@ def arm_compaction(
     from_extension: bool = False,
 ) -> int:
     db.ensure_schema()
-    digest = compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions)
+    current_scope = scope_id(scope)
+    architecture = load_architecture(current_scope)
+    digest = compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions, architecture, current_scope, policy, budget_tokens)
+    cutoff = datetime.now(timezone.utc) - ARMED_TTL
     with db.connect() as conn:
         row = conn.execute(
-            "INSERT INTO compaction (scope_id, summary, validation_score, compression_ratio, digest, status, probes, from_extension) "
-            "VALUES (%s, '', 0, 0, %s, 'in_progress', '[]'::jsonb, %s) RETURNING id",
-            (scope_id(scope), digest, from_extension),
+            "SELECT id FROM compaction WHERE scope_id = %s AND digest = %s AND "
+            "(status = 'in_progress' OR (status = 'done' AND created_at >= %s)) "
+            "ORDER BY CASE status WHEN 'in_progress' THEN 0 ELSE 1 END, created_at DESC LIMIT 1",
+            (current_scope, digest, cutoff),
         ).fetchone()
-    start_compaction_worker()
-    _armed_jobs.put((row["id"], scope, conversation, budget_tokens, turn_prefix, previous_summary, custom_instructions, file_ops, policy, from_extension, digest))
+        if row:
+            return row["id"]
+        row = conn.execute(
+            "INSERT INTO compaction (scope_id, summary, validation_score, compression_ratio, digest, status, probes, from_extension) "
+            "VALUES (%s, '', 0, 0, %s, 'in_progress', '[]'::jsonb, %s) "
+            "ON CONFLICT (digest) WHERE status = 'in_progress' DO NOTHING RETURNING id",
+            (current_scope, digest, from_extension),
+        ).fetchone()
+        inserted = row is not None
+        if row is None:
+            row = conn.execute(
+                "SELECT id FROM compaction WHERE scope_id = %s AND digest = %s AND status = 'in_progress'",
+                (current_scope, digest),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("armed compaction deduplication lost its row")
+    if inserted:
+        start_compaction_worker()
+        _armed_jobs.put((row["id"], scope, conversation, budget_tokens, turn_prefix, previous_summary, custom_instructions, file_ops, policy, from_extension, digest, architecture))
     return row["id"]
 
 
@@ -334,6 +379,7 @@ def _finish_armed(
     policy: str | None,
     from_extension: bool,
     digest: str,
+    architecture: dict[str, Any],
 ) -> None:
     try:
         compact(
@@ -348,6 +394,7 @@ def _finish_armed(
             from_extension,
             compaction_id,
             digest,
+            architecture,
         )
     except Exception:
         with db.connect() as conn:
@@ -361,14 +408,18 @@ def match_compaction(
     previous_summary: str | None = None,
     custom_instructions: str | None = None,
     file_ops: dict[str, list[str]] | None = None,
+    policy: str | None = None,
+    budget_tokens: int = 1500,
 ) -> dict[str, Any] | None:
-    digest = compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions)
+    current_scope = scope_id(scope)
+    architecture = load_architecture(current_scope)
+    digest = compaction_digest(conversation, turn_prefix, previous_summary, file_ops, custom_instructions, architecture, current_scope, policy, budget_tokens)
     with db.connect() as conn:
         row = conn.execute(
             "SELECT summary, validation_score, compression_ratio, probes, from_extension FROM compaction "
             "WHERE scope_id = %s AND digest = %s AND status = 'done' AND validation_score >= %s "
             "ORDER BY created_at DESC LIMIT 1",
-            (scope_id(scope), digest, VALIDATION_THRESHOLD),
+            (current_scope, digest, VALIDATION_THRESHOLD),
         ).fetchone()
     return dict(row) if row else None
 def _literal(vector: Any) -> str:

@@ -101,6 +101,8 @@ ALTER TABLE compaction ADD COLUMN IF NOT EXISTS probes jsonb NOT NULL DEFAULT '[
 ALTER TABLE compaction ADD COLUMN IF NOT EXISTS from_extension boolean NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS compaction_match_idx ON compaction (scope_id, digest, created_at DESC)
     WHERE status = 'done' AND validation_score >= 0.8;
+CREATE UNIQUE INDEX IF NOT EXISTS compaction_in_progress_digest_idx ON compaction (digest)
+    WHERE status = 'in_progress';
 CREATE TABLE IF NOT EXISTS prefetch (
     id              serial PRIMARY KEY,
     scope_id        integer NOT NULL REFERENCES scope(id) ON DELETE CASCADE,

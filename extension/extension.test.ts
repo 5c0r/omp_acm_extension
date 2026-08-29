@@ -1,6 +1,6 @@
 import { expect, test, vi } from "bun:test";
 
-import acmExtension from "./index";
+import acmExtension, { shouldAutoArm } from "./index";
 
 type ExtensionHandler = (event: never, ctx: never) => Promise<unknown> | unknown;
 type RegisteredTool = {
@@ -117,7 +117,9 @@ test("/acm selfcheck exercises every ACM endpoint", async () => {
       "project:acm-selfcheck-session-5",
       "project:acm-selfcheck-session-5",
       "project:acm-selfcheck-session-5",
+      "project:acm-selfcheck-session-5",
     ]);
+    expect(requests.find(request => request.url.endsWith("/compact"))?.body?.scope).toBe("project:acm-selfcheck-session-5");
     expect(requests.find(request => request.url.endsWith("/anticipate"))?.body?.session_id).toBe("acm-selfcheck-session-5");
     expect(notices).toEqual([[
       "ACM selfcheck",
@@ -195,6 +197,7 @@ test("tools route scoped requests to ACM endpoints", async () => {
       { url: "http://localhost:8927/fetch", body: { query: "billing", scope: "project:acm-tools", budget_tokens: 600, deep: true } },
       { url: "http://localhost:8927/ingest", body: { scope: "project:shared", text: "retain this", source_ref: "note-1" } },
       { url: "http://localhost:8927/compact", body: {
+        scope: "project:acm-tools",
         conversation: [{ role: "user", content: "compact this" }],
         budget_tokens: 100,
         file_ops: { read: ["src/a.ts"], written: [], edited: ["src/a.ts"] },
@@ -255,7 +258,9 @@ test("turn end queues a bounded trajectory for anticipation", async () => {
   }
 });
 
-test("turn end arms a branch snapshot above the context threshold", async () => {
+test("turn end leaves automatic compaction off by default", async () => {
+  const originalAutoArm = process.env.ACM_AUTO_ARM;
+  delete process.env.ACM_AUTO_ARM;
   const { handlers } = extensionStub();
   const turnEndHandler = handlers.turn_end;
   expect(turnEndHandler).toBeTypeOf("function");
@@ -276,39 +281,30 @@ test("turn end arms a branch snapshot above the context threshold", async () => 
         getContextUsage: () => ({ tokens: 61, contextWindow: 100 }),
         sessionManager: {
           getSessionId: () => "session-armed",
-          getBranch: () => [
-            { type: "message", message: { role: "user", content: "Pre-compaction history." } },
-            { type: "compaction", summary: "Previous validated summary." },
-            { type: "message", message: { role: "user", content: "Keep billing decision." } },
-            { type: "message", message: { role: "assistant", content: "Ready to compact." } },
-          ],
+          getBranch: () => [{ type: "message", message: { role: "user", content: "History." } }],
         },
         setTimeout: (callback: () => Promise<void>) => timers.push(callback),
       },
     );
-    expect(timers).toHaveLength(2);
+    expect(timers).toHaveLength(1);
     await timers[0]?.();
-    await timers[1]?.();
-    expect(requests[1]).toMatchObject({
-      url: "http://localhost:8927/compact",
-      body: {
-        scope: "project:feat-acm-omp-extension",
-        conversation: [
-          { role: "user", content: "Keep billing decision." },
-          { role: "assistant", content: "Ready to compact." },
-        ],
-        turn_prefix: null,
-        previous_summary: "Previous validated summary.",
-        file_ops: { read: [], written: [], edited: [] },
-        custom_instructions: null,
-        budget_tokens: 1500,
-        async: true,
-        from_extension: true,
-      },
-    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe("http://localhost:8927/anticipate");
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalAutoArm === undefined) delete process.env.ACM_AUTO_ARM;
+    else process.env.ACM_AUTO_ARM = originalAutoArm;
   }
+});
+
+test("auto arm gate fires once for a threshold crossing", () => {
+  const state = { aboveThreshold: false };
+  expect(shouldAutoArm(state, 0.61, "first", 0)).toBeTrue();
+  expect(shouldAutoArm(state, 0.8, "first", 1)).toBeFalse();
+  expect(shouldAutoArm(state, 0.5, "first", 2)).toBeFalse();
+  expect(shouldAutoArm(state, 0.61, "first", 3)).toBeFalse();
+  expect(shouldAutoArm(state, 0.5, "first", 4)).toBeFalse();
+  expect(shouldAutoArm(state, 0.61, "second", 5)).toBeTrue();
 });
 
 test("armed compaction match keeps unrelated preserve data but discards stale payloads", async () => {

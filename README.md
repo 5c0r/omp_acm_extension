@@ -8,7 +8,7 @@ Local ACM service plus Oh My Pi extension. OMP core remains untouched: `extensio
 OMP extension
   ├─ session_before_compact ──> POST /compact/match ──> exact validated hit | native fallback
   ├─ agent_end ──────────────> POST /ingest ───> async extract/store
-  ├─ turn_end ───────────────> POST /anticipate + async /compact arm above 60% context
+  ├─ turn_end ───────────────> POST /anticipate; automatic compaction arming disabled
   ├─ context ────────────────> GET /bundle/{session} -> user memory
   └─ acm_* tools, /acm command ────────────────> ACM HTTP API
 
@@ -56,7 +56,7 @@ Disable extension through OMP settings:
 | Ingesting | Mnemopi LLM fact extraction, `proactiveLinking` episodic graph, local embeddings, FTS, working-memory TTL, sleep/consolidation: largely present. [Source: `omp://mnemosyne-memory-backend.md`] | Architecture-driven extraction; entity-resolution cascade with aliases; temporal validity; async job IDs; write-side sanitization. |
 | Scoping | Global, per-project, and per-project-tagged banks: two-level personal scope. [Source: `omp://mnemosyne-memory-backend.md`] | Provenance-tagged, token-budgeted assembly. |
 | Anticipating | `compaction.asyncEnabled` speculates only about compaction; Mnemopi `enhancedRecall` is a query cache, which paper §4 explicitly excludes. Absent. [Source: `omp://mnemosyne-memory-backend.md`] | Trajectory-predicted precomputed session bundle; `context` is pure cache read; `acm_fetch` is explicit miss fallback; hit-rate stats. |
-| Compacting & consolidation | `remote`/`snapcompact`/`handoff`/`shake`/`soft` method order, pruning, and useless-elision: strongest-in-class machinery, but no validation contract. [Source: `omp://compaction.md`] | Probe/reference-pair recoverability validation, equivalence judging, deterministic verbatim/file checks, score-0 fall-through, retry ladder with real budget growth. Hook is exact-digest cache read under OMP's 30-second cap: armed hit applies validated compaction; mismatch falls through native; `acm_compact` remains explicit path. |
+| Compacting & consolidation | `remote`/`snapcompact`/`handoff`/`shake`/`soft` method order, pruning, and useless-elision: strongest-in-class machinery, but no validation contract. [Source: `omp://compaction.md`] | Probe/reference-pair recoverability validation, equivalence judging, deterministic verbatim/file checks, score-0 fall-through, retry ladder with real budget growth. Hook is exact-digest cache read under OMP's 30-second cap. Automatic validated compaction ships off until live OMP proves an auto-threshold compaction matches an armed digest; `acm_compact` remains guaranteed path. |
 
 ## Current gaps
 
@@ -64,7 +64,7 @@ Disable extension through OMP settings:
 |---|---|---|
 | Trust boundary | Sanitizes persisted/served memory; service is local-only, no auth. | Expose beyond loopback -> add authenticated API boundary and ACLs. |
 | Anticipation | Best-effort async cache; a missing/expired bundle injects nothing. | Need guaranteed recall -> use explicit `acm_fetch`. |
-| Compaction | Above 60% context, turn end serially arms a validated snapshot. Hook only reads an exact canonical-digest match; any miss falls through native. | Mirror mismatch in real OMP -> disable arming and use explicit `acm_compact`; do not raise OMP core cap. |
+| Compaction | Automatic validated compaction is off (`ACM_AUTO_ARM=0`): public `turn_end` lacks native preparation's dynamic cut point, turn prefix, and file ops. Hook only reads an exact canonical-digest match; any miss falls through native. | Live OMP proves an automatic threshold compaction matches an armed digest -> enable arming; otherwise use explicit `acm_compact`. |
 | Selfcheck | Intentionally writes only synthetic scope/bundle; may wait up to about one minute for async bundle. | Need non-mutating probe -> add service-owned health/readiness route. |
 
 ## Per-turn pattern

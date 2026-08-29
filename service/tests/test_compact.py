@@ -245,7 +245,7 @@ def test_compaction_refuses_to_validate_when_summary_model_fails(monkeypatch):
     from acm import compact as module
 
     pairs = [{"question": f"q{index}", "reference_answer": "April 3"} for index in range(5)]
-    monkeypatch.setattr(module, "_evidence", lambda _input: (pairs, []))
+    monkeypatch.setattr(module, "_evidence", lambda *_args: (pairs, []))
     monkeypatch.setattr(module, "_summary", lambda *_args: None)
 
     result = module.compact([{"role": "user", "content": "Launch date is April 3."}], budget_tokens=100)
@@ -256,7 +256,7 @@ def test_compaction_carries_mandatory_values_into_summary_before_validation(monk
     from acm import compact as module
 
     pairs = [{"question": f"q{index}", "reference_answer": "April 3"} for index in range(5)]
-    monkeypatch.setattr(module, "_evidence", lambda _input: (pairs, ["release-lock"]))
+    monkeypatch.setattr(module, "_evidence", lambda *_args: (pairs, ["release-lock"]))
     monkeypatch.setattr(module, "_summary", lambda *_args: "Launch date is April 3.")
 
     def validate(summary, _pairs, _mandatory):
@@ -334,6 +334,8 @@ with TestClient(app) as client:
     assert result["from_extension"] is True
     mismatch = dict(match_payload, conversation=[{"role": "user", "content": "Different fact."}])
     assert client.post("/compact/match", json=mismatch).status_code == 404
+    budget_mismatch = dict(match_payload, budget_tokens=1500)
+    assert client.post("/compact/match", json=budget_mismatch).status_code == 404
 server.shutdown()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
@@ -388,3 +390,159 @@ def test_compaction_digest_is_exact_but_file_order_independent():
 
     assert first == reordered
     assert first != changed
+
+
+def test_duplicate_armed_compaction_reuses_done_job_within_ttl(monkeypatch):
+    from acm import compact as module
+    from acm import db
+    import time
+    import uuid
+
+    def fake_compact(*args):
+        with db.connect() as conn:
+            conn.execute("UPDATE compaction SET status = 'done' WHERE id = %s", (args[9],))
+        return {"summary": "done", "validation_score": 1.0, "compression_ratio": 0.1, "probes": []}
+
+    monkeypatch.setattr(module, "compact", fake_compact)
+    scope = f"project:dedup-{uuid.uuid4().hex}"
+    first = module.arm_compaction(scope, [{"role": "user", "content": "same"}], 100)
+    for _ in range(100):
+        with db.connect() as conn:
+            row = conn.execute("SELECT status FROM compaction WHERE id = %s", (first,)).fetchone()
+        if row and row["status"] == "done":
+            break
+        time.sleep(0.02)
+    second = module.arm_compaction(scope, [{"role": "user", "content": "same"}], 100)
+
+    with db.connect() as conn:
+        rows = conn.execute("SELECT id FROM compaction WHERE id IN (%s, %s)", (first, second)).fetchall()
+    assert first == second
+    assert len(rows) == 1
+
+
+def test_concurrent_same_digest_arms_enqueue_the_inserter_once(monkeypatch):
+    """Fails if the conflict loser queues an already in-progress compaction."""
+    from contextlib import contextmanager
+    from queue import Queue
+    from acm import compact as module
+    from acm import db
+    from acm.retrieve import scope_id
+    import threading
+    import uuid
+
+    db.ensure_schema()
+    scope = f"project:race-{uuid.uuid4().hex}"
+    scope_id(scope)
+    original_connect = db.connect
+    selected = threading.Barrier(2)
+    selected_lock = threading.Lock()
+    selected_count = 0
+
+    @contextmanager
+    def gated_connect():
+        nonlocal selected_count
+        with original_connect() as conn:
+            class GatedConnection:
+                def execute(self, query, *args, **kwargs):
+                    nonlocal selected_count
+                    result = conn.execute(query, *args, **kwargs)
+                    if "FROM compaction WHERE scope_id = %s AND digest = %s AND " in query:
+                        with selected_lock:
+                            selected_count += 1
+                            wait = selected_count <= 2
+                        if wait:
+                            selected.wait(timeout=5)
+                    return result
+            yield GatedConnection()
+
+    jobs = Queue()
+    monkeypatch.setattr(module.db, "connect", gated_connect)
+    monkeypatch.setattr(module.db, "ensure_schema", lambda: None)
+    monkeypatch.setattr(module, "start_compaction_worker", lambda: None)
+    monkeypatch.setattr(module, "_armed_jobs", jobs)
+    ids = []
+    errors = []
+
+    def arm():
+        try:
+            ids.append(module.arm_compaction(scope, [{"role": "user", "content": "same"}], 100))
+        except Exception as error:
+            errors.append(error)
+
+    first = threading.Thread(target=arm)
+    second = threading.Thread(target=arm)
+    first.start()
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not errors
+    assert len(ids) == 2
+    assert ids[0] == ids[1]
+    assert jobs.qsize() == 1
+
+def test_scoped_architecture_controls_compaction_policy_probes_and_digest(monkeypatch):
+    from acm import compact as module
+    from acm import db
+    from acm.retrieve import scope_id
+    import json
+    import uuid
+
+    prompts = []
+    compliance = "COMPLIANCE-7"
+
+    def fake_chat(_system, user, _schema_hint="", max_tokens=None):
+        prompts.append(user)
+        if "TASK: probes" in user:
+            return {
+                "probes": [{"question": f"p{index}", "reference_answer": f"a{index}"} for index in range(1, 6)],
+                "must_preserve_verbatim": [compliance] if "compliance_obligations" in user else [],
+            }
+        if "TASK: summary-answers" in user:
+            return {"answers": [f"a{index}" for index in range(1, 6)]}
+        if "TASK: judge" in user:
+            return {"verdicts": ["correct"] * 5}
+        return {"summary": "a1 a2 a3 a4 a5"}
+
+    monkeypatch.setattr(module, "chat_json", fake_chat)
+    scope = f"project:architecture-{uuid.uuid4().hex}"
+    custom_spec = {
+        "categories": [
+            {"name": "compliance_obligations", "description": "Binding controls.", "examples": [], "retention": "long-term", "must_preserve_verbatim": True},
+            {"name": "facts", "description": "Stable facts.", "examples": [], "retention": "until superseded", "must_preserve_verbatim": False},
+            {"name": "preferences", "description": "Working preferences.", "examples": [], "retention": "long-term", "must_preserve_verbatim": False},
+        ],
+        "extraction_guidance": "Extract compliance obligations.",
+        "compaction_policy": "Preserve compliance obligations verbatim.",
+    }
+    changed_spec = {
+        **custom_spec,
+        "categories": [
+            {"name": "facts", "description": "Stable facts.", "examples": [], "retention": "until superseded", "must_preserve_verbatim": False},
+            {"name": "preferences", "description": "Working preferences.", "examples": [], "retention": "long-term", "must_preserve_verbatim": False},
+            {"name": "episodes", "description": "Past work.", "examples": [], "retention": "short-term", "must_preserve_verbatim": False},
+        ],
+        "compaction_policy": "Preserve revised records.",
+    }
+    db.ensure_schema()
+    current_scope = scope_id(scope)
+    with db.connect() as conn:
+        conn.execute("INSERT INTO architecture (scope_id, spec) VALUES (%s, %s::jsonb)", (current_scope, json.dumps(custom_spec)))
+    conversation = [{"role": "user", "content": f"a1 a2 a3 a4 a5 {compliance}"}]
+    custom = module.compact(conversation, 100, scope=scope, policy="Also retain audit trail.")
+    custom_prompts = prompts[:]
+    with db.connect() as conn:
+        conn.execute("UPDATE architecture SET spec = %s::jsonb WHERE scope_id = %s", (json.dumps(changed_spec), current_scope))
+    changed = module.compact(conversation, 100, scope=scope)
+
+    with db.connect() as conn:
+        digests = conn.execute(
+            "SELECT digest FROM compaction WHERE scope_id = %s ORDER BY id DESC LIMIT 2", (current_scope,)
+        ).fetchall()
+    assert any("compliance_obligations" in prompt for prompt in custom_prompts)
+    assert any("Preserve compliance obligations verbatim." in prompt for prompt in custom_prompts)
+    assert any("Also retain audit trail." in prompt for prompt in custom_prompts)
+    assert compliance in custom["summary"]
+    assert compliance not in changed["summary"]
+    assert digests[0]["digest"] != digests[1]["digest"]
+    assert module.match_compaction(scope, conversation, budget_tokens=100)["summary"] == changed["summary"]

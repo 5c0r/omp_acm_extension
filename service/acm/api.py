@@ -164,6 +164,8 @@ def compact_match(request: CompactRequest) -> dict[str, Any]:
         request.previous_summary,
         request.custom_instructions,
         request.file_ops,
+        request.policy,
+        request.budget_tokens,
     )
     if not result:
         raise HTTPException(status_code=404, detail="matching compaction not found")

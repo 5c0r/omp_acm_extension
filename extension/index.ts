@@ -44,33 +44,22 @@ function fileOps(value: unknown): { read: string[]; written: string[]; edited: s
   return { read: paths("read"), written: paths("written"), edited: paths("edited") };
 }
 
-function branchSnapshot(entries: readonly unknown[]) {
-  let start = 0;
-  let previous_summary: string | null = null;
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    if (
-      typeof entry === "object"
-      && entry !== null
-      && "type" in entry
-      && entry.type === "compaction"
-    ) {
-      start = index + 1;
-      previous_summary = "summary" in entry && typeof entry.summary === "string" ? entry.summary : null;
-      break;
-    }
+export function shouldAutoArm(
+  state: { aboveThreshold: boolean; digest?: string; armedAt?: number },
+  usageRatio: number,
+  digest: string,
+  now: number,
+) {
+  if (usageRatio <= 0.6) {
+    state.aboveThreshold = false;
+    return false;
   }
-  const rawMessages = entries.slice(start).flatMap(entry => {
-    if (
-      typeof entry !== "object"
-      || entry === null
-      || !("type" in entry)
-      || entry.type !== "message"
-      || !("message" in entry)
-    ) return [];
-    return [entry.message];
-  });
-  return { conversation: messages(rawMessages), previous_summary };
+  if (state.aboveThreshold) return false;
+  state.aboveThreshold = true;
+  if (state.digest === digest && now - (state.armedAt ?? 0) < 600_000) return false;
+  state.digest = digest;
+  state.armedAt = now;
+  return true;
 }
 function acmPreserveData(previous: Record<string, unknown> | undefined, response: CompactResponse) {
   const preserved = Object.fromEntries(
@@ -107,6 +96,7 @@ export default function acmExtension(pi: ExtensionAPI) {
   const harvested = new Map<string, { seen: Set<string>; fifo: string[] }>();
   const latestUser = new Map<string, string>();
   let autoInject = process.env.ACM_AUTO_INJECT !== "0";
+  const autoArmEnabled = process.env.ACM_AUTO_ARM === "1";
   let lastCompaction: CompactResponse | undefined;
   const z = pi.zod;
 
@@ -153,8 +143,9 @@ export default function acmExtension(pi: ExtensionAPI) {
         edited: z.array(z.string()).optional(),
       }).optional(),
     }),
-    async execute(_id, params, signal) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       return toolResult(await acmRequest("/compact", "POST", {
+        scope: projectScope(ctx.cwd),
         conversation: [{ role: "user", content: params.conversation }],
         budget_tokens: params.budget_tokens ?? 1500,
         previous_summary: params.previous_summary,
@@ -234,6 +225,7 @@ export default function acmExtension(pi: ExtensionAPI) {
           if (!bundle && attempt < 14) await Bun.sleep(Math.min(250 * 2 ** attempt, 5_000));
         }
         const compact = await acmRequest("/compact", "POST", {
+          scope,
           conversation: [{ role: "user", content: "ACM selfcheck" }],
           budget_tokens: 1,
         });
@@ -311,26 +303,9 @@ export default function acmExtension(pi: ExtensionAPI) {
       },
       0,
     );
-    const usage = ctx.getContextUsage();
-    if (!usage || !usage.contextWindow || usage.tokens / usage.contextWindow <= 0.6) return;
-    const snapshot = branchSnapshot(ctx.sessionManager.getBranch());
-    if (!snapshot.conversation.length) return;
-    ctx.setTimeout(
-      async () => {
-        await acmRequest("/compact", "POST", {
-          scope: projectScope(ctx.cwd),
-          conversation: snapshot.conversation,
-          turn_prefix: null,
-          previous_summary: snapshot.previous_summary,
-          file_ops: { read: [], written: [], edited: [] },
-          custom_instructions: null,
-          budget_tokens: 1500,
-          async: true,
-          from_extension: true,
-        });
-      },
-      0,
-    );
+    if (!autoArmEnabled) return;
+    // ponytail: OMP TurnEndEvent lacks native TreePreparation, whose dynamic cut point,
+    // turn prefix, and file ops define exact hook identity. Arm only once it exposes that input.
   });
 
   pi.on("agent_end", (event, ctx) => {

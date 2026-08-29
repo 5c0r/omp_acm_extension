@@ -73,6 +73,12 @@ def _stored(scope_id: int) -> dict | None:
     return _normalize(row["spec"]) if row else None
 
 
+
+def load_architecture(scope_id: int | None) -> dict:
+    """Return table-backed scope architecture, falling back to the default."""
+    spec = _stored(scope_id) if scope_id is not None else None
+    return spec or json.loads(json.dumps(DEFAULT_ARCHITECTURE))
+
 def _save(scope_id: int, spec: dict) -> None:
     with db.connect() as conn:
         conn.execute(
