@@ -131,8 +131,9 @@ def patch_memory(memory_id: int, request: MemoryPatch) -> dict[str, Any]:
         sets.append("pinned = %s")
         params.append(values["pinned"])
     params.append(current["id"])
-    with db.connect() as conn:
+    with db.connect() as conn, conn.transaction():
         conn.execute(f"UPDATE memory SET {', '.join(sets)} WHERE id = %s", params)
+        _invalidate_bundles(conn, [memory_id])
     return _memory_payload(_memory(memory_id))
 
 

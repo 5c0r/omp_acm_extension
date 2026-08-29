@@ -236,6 +236,25 @@ def test_archive_and_merge_invalidate_cached_bundles() -> None:
         assert client.get(f"/bundle/{sessions['merge-target'][0]}").status_code == 404
 
 
+def test_patch_invalidates_cached_bundles() -> None:
+    """Fails if cached rendering keeps serving pre-edit memory content."""
+    scope = _scope()
+
+    with TestClient(app) as client:
+        memory_id = _memory(scope, "Patch bundle original.")
+        session_id = f"patch-{uuid.uuid4().hex}"
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO bundle (session_id, scope_id, rendered, predicted_intents, memory_ids, memory_ids_version, expires_at) "
+                "VALUES (%s, %s, '[acm memory]', '[]'::jsonb, %s::jsonb, 1, now() + interval '5 minutes')",
+                (session_id, _scope_id(scope), json.dumps([memory_id])),
+            )
+
+        assert client.get(f"/bundle/{session_id}").status_code == 200
+        assert client.patch(f"/memories/{memory_id}", json={"content": "Patch bundle edited."}).status_code == 200
+        assert client.get(f"/bundle/{session_id}").status_code == 404
+
+
 def test_compaction_uses_session_usage_since_prior_compaction() -> None:
     """Fails if compact attribution uses content matching or reuses older session usage."""
     scope = _scope()
