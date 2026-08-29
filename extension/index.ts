@@ -192,6 +192,7 @@ export default function acmExtension(pi: ExtensionAPI) {
         scope: projectScope(ctx.cwd),
         budget_tokens: params.budget_tokens ?? 1500,
         deep: params.deep ?? false,
+        session_id: ctx.sessionManager.getSessionId(),
       }, signal));
     },
   });
@@ -227,6 +228,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     async execute(_id, params, signal, _onUpdate, ctx) {
       const response = await acmRequest<CompactResponse>("/compact", "POST", {
         scope: projectScope(ctx.cwd),
+        session_id: ctx.sessionManager.getSessionId(),
         conversation: [{ role: "user", content: params.conversation }],
         budget_tokens: params.budget_tokens ?? 1500,
         previous_summary: params.previous_summary,
@@ -301,7 +303,7 @@ export default function acmExtension(pi: ExtensionAPI) {
         });
         const jobId = typeof ingest?.job_id === "number" ? ingest.job_id : 0;
         const status = await acmRequest(`/status/${jobId}`);
-        const fetch = await acmRequest("/fetch", "POST", { query: "ACM selfcheck", scope, budget_tokens: 1, deep: false });
+        const fetch = await acmRequest("/fetch", "POST", { query: "ACM selfcheck", scope, budget_tokens: 1, deep: false, session_id: sessionId });
         const anticipate = await acmRequest("/anticipate", "POST", {
           session_id: selfcheckSessionId,
           scope,
@@ -314,6 +316,7 @@ export default function acmExtension(pi: ExtensionAPI) {
         }
         const compact = await acmRequest("/compact", "POST", {
           scope,
+          session_id: sessionId,
           conversation: [{ role: "user", content: "ACM selfcheck" }],
           budget_tokens: 1,
         });

@@ -43,6 +43,21 @@ CREATE INDEX IF NOT EXISTS memory_tsv_idx ON memory USING gin (tsv);
 CREATE INDEX IF NOT EXISTS memory_scope_idx ON memory (scope_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS memory_hnsw_idx ON memory USING hnsw (embedding vector_cosine_ops);
 
+ALTER TABLE memory ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false;
+ALTER TABLE memory ADD COLUMN IF NOT EXISTS merged_into integer REFERENCES memory(id);
+ALTER TABLE memory ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id         bigserial PRIMARY KEY,
+    memory_id  bigint NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    use_type   text NOT NULL CHECK (use_type IN ('fetch', 'bundle', 'compact')),
+    session_id text,
+    scope      text,
+    ts         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS usage_log_memory_idx ON usage_log (memory_id);
+CREATE INDEX IF NOT EXISTS usage_log_ts_idx ON usage_log (ts);
+
 CREATE TABLE IF NOT EXISTS entity (
     id             serial PRIMARY KEY,
     scope_id       integer NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
@@ -123,6 +138,8 @@ CREATE TABLE IF NOT EXISTS bundle (
     expires_at        timestamptz NOT NULL,
     created_at        timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE bundle ADD COLUMN IF NOT EXISTS memory_ids jsonb;
+ALTER TABLE bundle ADD COLUMN IF NOT EXISTS memory_ids_version smallint;
 
 CREATE TABLE IF NOT EXISTS stats (
     key   text PRIMARY KEY,
@@ -132,6 +149,8 @@ CREATE TABLE IF NOT EXISTS stats (
 
 _seed_lock = threading.Lock()
 _seeded = False
+_SCHEMA_LOCK = 8_465_414
+
 
 
 def connect():
@@ -141,7 +160,11 @@ def connect():
 def ensure_schema() -> None:
     global _seeded
     with connect() as conn:
-        conn.execute(_DDL)
+        conn.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK,))
+        try:
+            conn.execute(_DDL)
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK,))
     with _seed_lock:
         if _seeded:
             return

@@ -212,6 +212,8 @@ test("/acm selfcheck exercises every ACM endpoint", async () => {
       "project:acm-selfcheck-session-5",
     ]);
     expect(requests.find(request => request.url.endsWith("/compact"))?.body?.scope).toBe("project:acm-selfcheck-session-5");
+    expect(requests.find(request => request.url.endsWith("/fetch"))?.body?.session_id).toBe("session-5");
+    expect(requests.find(request => request.url.endsWith("/compact"))?.body?.session_id).toBe("session-5");
     expect(requests.find(request => request.url.endsWith("/anticipate"))?.body?.session_id).toBe("acm-selfcheck-session-5");
     expect(notices).toEqual([[
       "ACM selfcheck",
@@ -296,7 +298,7 @@ test("tools route scoped requests to ACM endpoints", async () => {
     await invoke("acm_status", { job_id: 7 });
     await invoke("acm_consolidate", { scope: "project:shared" });
     expect(requests).toEqual([
-      { url: "http://localhost:8927/fetch", body: { query: "billing", scope: "project:acm-tools", budget_tokens: 600, deep: true } },
+      { url: "http://localhost:8927/fetch", body: { query: "billing", scope: "project:acm-tools", budget_tokens: 600, deep: true, session_id: "session-3" } },
       { url: "http://localhost:8927/ingest", body: { scope: "project:shared", text: "retain this", source_ref: "note-1" } },
       { url: "http://localhost:8927/compact", body: {
         scope: "project:acm-tools",
@@ -304,6 +306,7 @@ test("tools route scoped requests to ACM endpoints", async () => {
         budget_tokens: 100,
         file_ops: { read: ["src/a.ts"], written: [], edited: ["src/a.ts"] },
         custom_instructions: "retain rollout details",
+        session_id: "session-3",
       } },
       { url: "http://localhost:8927/architect", body: { scope: "project:acm-tools", description: "billing memory", reference: "ADR-1" } },
       { url: "http://localhost:8927/status/7", body: undefined },

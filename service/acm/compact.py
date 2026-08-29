@@ -13,6 +13,7 @@ from .architect import DEFAULT_ARCHITECTURE, load_architecture
 from .entities import vector_literal
 from .llm import chat_json, tokens
 from .retrieve import scope_id
+from .usage import log_compaction_usage
 
 VALIDATION_THRESHOLD = 0.80
 COMPACT_MAX_OUTPUT = int(os.environ.get("ACM_COMPACT_MAX_OUTPUT", "2048"))
@@ -26,6 +27,7 @@ _armed_worker_lock = threading.Lock()
 
 def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
+
 
 
 def _canonical_messages(messages: list[dict[str, Any]] | None) -> list[list[Any]] | None:
@@ -220,6 +222,7 @@ def compact(
     compaction_id: int | None = None,
     digest: str | None = None,
     architecture: dict[str, Any] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     current_scope = scope_id(scope) if scope else None
     architecture = architecture or load_architecture(current_scope)
@@ -303,6 +306,7 @@ def compact(
                 "WHERE id = %s",
                 (final_summary, score, ratio, json.dumps(probes), compaction_id),
             )
+    log_compaction_usage(session_id, scope)
     return result
 
 
@@ -332,6 +336,7 @@ def arm_compaction(
     file_ops: dict[str, list[str]] | None = None,
     policy: str | None = None,
     from_extension: bool = False,
+    session_id: str | None = None,
 ) -> int:
     db.ensure_schema()
     current_scope = scope_id(scope)
@@ -363,7 +368,7 @@ def arm_compaction(
                 raise RuntimeError("armed compaction deduplication lost its row")
     if inserted:
         start_compaction_worker()
-        _armed_jobs.put((row["id"], scope, conversation, budget_tokens, turn_prefix, previous_summary, custom_instructions, file_ops, policy, from_extension, digest, architecture))
+        _armed_jobs.put((row["id"], scope, conversation, budget_tokens, turn_prefix, previous_summary, custom_instructions, file_ops, policy, from_extension, digest, architecture, session_id))
     return row["id"]
 
 
@@ -380,6 +385,7 @@ def _finish_armed(
     from_extension: bool,
     digest: str,
     architecture: dict[str, Any],
+    session_id: str | None,
 ) -> None:
     try:
         compact(
@@ -395,6 +401,7 @@ def _finish_armed(
             compaction_id,
             digest,
             architecture,
+            session_id,
         )
     except Exception:
         with db.connect() as conn:
