@@ -229,12 +229,12 @@ test("/acm browse blocks on full content before reopening actions", async () => 
 
   const content = "Widget API key rotates weekly; regenerate it through the internal secrets portal.";
   const actionTitles: string[] = [];
-  const viewerCalls: Array<[string, string]> = [];
+  const viewerCalls: Array<[string, string[]]> = [];
   let actionCall = 0;
   let signalViewer!: () => void;
-  let dismissViewer!: (value: boolean) => void;
+  let dismissViewer!: (value: string | undefined) => void;
   const viewerOpened = new Promise<void>(resolve => { signalViewer = resolve; });
-  const viewerDismissed = new Promise<boolean>(resolve => { dismissViewer = resolve; });
+  const viewerDismissed = new Promise<string | undefined>(resolve => { dismissViewer = resolve; });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async url => {
     const address = String(url);
@@ -248,23 +248,23 @@ test("/acm browse blocks on full content before reopening actions", async () => 
       ui: {
         select: async (title: string, options: string[]) => {
           if (title === "ACM browse — scope" || title === "ACM browse — memory") return options[0];
+          if (options.length === 1 && options[0] === "Back") {
+            viewerCalls.push([title, options]);
+            signalViewer();
+            return viewerDismissed;
+          }
           if (title.startsWith("ACM memory #")) {
             actionTitles.push(title);
             return ["View content", "Done"][actionCall++];
           }
           return undefined;
         },
-        confirm: async (title: string, message: string) => {
-          viewerCalls.push([title, message]);
-          signalViewer();
-          return viewerDismissed;
-        },
       },
     } as never);
     await viewerOpened;
-    expect(viewerCalls).toEqual([["ACM memory #41 [fact] active", content]]);
+    expect(viewerCalls).toEqual([[`ACM memory #41 [fact] active\n\n${content}`, ["Back"]]]);
     expect(actionTitles).toEqual(["ACM memory #41 [fact] active"]);
-    dismissViewer(true);
+    dismissViewer("Back");
     await browsing;
     expect(actionTitles).toEqual(["ACM memory #41 [fact] active", "ACM memory #41 [fact] active"]);
   } finally {

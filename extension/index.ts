@@ -399,7 +399,7 @@ export default function acmExtension(pi: ExtensionAPI) {
           );
           if (!action || action === "Done") return;
           if (action === "View content") {
-            await ctx.ui.confirm(`ACM memory #${current.id} [${current.kind}] ${current.status}${current.pinned ? " · pinned" : ""}`, current.content);
+            await ctx.ui.select(`ACM memory #${current.id} [${current.kind}] ${current.status}${current.pinned ? " · pinned" : ""}\n\n${current.content}`, ["Back"]);
             continue;
           }
 
