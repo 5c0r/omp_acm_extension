@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS bundle_event (
     ts         timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS bundle_event_scope_idx ON bundle_event (scope, outcome);
+CREATE INDEX IF NOT EXISTS bundle_event_session_idx ON bundle_event (session_id, id DESC) WHERE scope IS NOT NULL;
 
 ALTER TABLE bundle_event ADD COLUMN IF NOT EXISTS id bigserial;
 CREATE TABLE IF NOT EXISTS entity (

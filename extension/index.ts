@@ -157,18 +157,24 @@ export type StatusState = {
 };
 
 export function renderStatusLine(state: StatusState): string {
-  if (state.online === false) return `ACM ${state.mode} · offline`;
-  const bundle = state.mode === "compaction" ? "—" : `✓${state.bundleHits} ✗${state.bundleMisses}`;
+  // Nerd Font: 󰍛 memory (ACM), 󰓦 bolt (bundle benchmark), 󰆼 database (ingest), 󰔉 gauge (compaction)
+  if (state.online === false) return `󰍛 ACM ${state.mode} · offline`;
+  const total = state.bundleHits + state.bundleMisses;
+  const rate = total ? Math.round((100 * state.bundleHits) / total) : null;
+  const bundle = state.mode === "compaction"
+    ? "—"
+    : `${rate === null ? "—" : `${rate}%`} ✓${state.bundleHits} ✗${state.bundleMisses}`;
   const compact = state.lastCompaction
     ? `${state.lastCompaction.validation_score.toFixed(2)}/${state.lastCompaction.compression_ratio.toFixed(2)}`
     : "—";
-  return `ACM ${state.mode} · bundle ${bundle} · ingest ${state.ingestCount} · last compact ${compact}`;
+  return `󰍛 ${state.mode} · 󰓦 ${bundle} · 󰆼 ${state.ingestCount} · 󰔉 ${compact}`;
 }
 
 
 export default function acmExtension(pi: ExtensionAPI) {
   pi.setLabel("Agentic Context Management");
   pi.registerFlag("acm-mode", { description: "ACM subsystem preset: full | memory | compaction", type: "string" });
+  pi.registerFlag("acm-status", { description: "ACM status line: on | off (also /acm status on|off at runtime)", type: "string" });
   let resolvedMode: ResolvedMode | undefined;
   const getMode = () => resolvedMode ??= resolveMode(pi);
   const harvested = new Map<string, { seen: Set<string>; fifo: string[] }>();
@@ -176,7 +182,9 @@ export default function acmExtension(pi: ExtensionAPI) {
   let autoInject = process.env.ACM_AUTO_INJECT !== "0";
   const autoArmEnabled = process.env.ACM_AUTO_ARM === "1";
   let lastCompaction: CompactResponse | undefined;
-  const statusLineEnabled = process.env.ACM_WIDGET !== "0";
+  // OMP applies CLI extension-flag values AFTER factories run, so the flag must be read lazily.
+  let statusOverride: boolean | undefined;
+  const statusLineOn = () => statusOverride ?? (process.env.ACM_WIDGET !== "0" && pi.getFlag("acm-status") !== "off");
   let bundleHits = 0;
   let bundleMisses = 0;
   let ingestCount = 0;
@@ -186,7 +194,7 @@ export default function acmExtension(pi: ExtensionAPI) {
     ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } },
     text: string,
   ) => {
-    if (!statusLineEnabled || !ctx.hasUI || !ctx.ui?.setStatus) return;
+    if (!statusLineOn() || !ctx.hasUI || !ctx.ui?.setStatus) return;
     try {
       ctx.ui.setStatus("acm", text);
       lastStatusLine = text;
@@ -194,7 +202,16 @@ export default function acmExtension(pi: ExtensionAPI) {
       // ponytail: status line is cosmetic — a failing UI surface must never break the handler
     }
   };
+  const clearStatusBar = (ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } }) => {
+    try {
+      ctx.ui?.setStatus?.("acm", undefined);
+      lastStatusLine = undefined;
+    } catch {
+      // cosmetic
+    }
+  };
   const updateStatus = (ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } }) => {
+    if (!statusLineOn()) return;
     const line = renderStatusLine({
       mode: getMode().mode,
       bundleHits,
@@ -206,9 +223,9 @@ export default function acmExtension(pi: ExtensionAPI) {
     if (line !== lastStatusLine) setStatusBar(ctx, line);
   };
   pi.on("session_start", async (_event, ctx) => {
-    if (!statusLineEnabled || !ctx.hasUI) return;
+    if (!statusLineOn() || !ctx.hasUI) return;
     serviceOnline = (await acmRequest("/health")) !== null;
-    setStatusBar(ctx, `ACM ${getMode().mode} · ${serviceOnline ? "connected" : "offline"}`);
+    setStatusBar(ctx, `󰍛 ACM ${getMode().mode} · ${serviceOnline ? "connected" : "offline"}`);
   });
   const z = pi.zod;
 
@@ -312,13 +329,26 @@ export default function acmExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const [command, value] = String(args).trim().split(/\s+/, 2);
       if (command === "status") {
+        if (value === "on" || value === "off") {
+          statusOverride = value === "on";
+          if (statusLineOn()) {
+            serviceOnline = (await acmRequest("/health")) !== null;
+            updateStatus(ctx);
+          } else {
+            clearStatusBar(ctx);
+          }
+          ctx.ui.notify(`󰍛 ACM status line ${value}`, "info");
+          return;
+        }
         const mode = getMode();
         const [health, stats] = await Promise.all([
           acmRequest<{ status?: string }>("/health"),
           acmRequest<{ stats?: Record<string, unknown> }>("/stats"),
         ]);
         const values = stats?.stats ?? {};
-        ctx.ui.notify(`ACM status: ${health?.status ?? "unavailable"}; mode=${mode.mode}; bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}; session ✓${bundleHits} ✗${bundleMisses}; ingest ${ingestCount}`, "info");
+        const total = bundleHits + bundleMisses;
+        const rate = total ? `${Math.round((100 * bundleHits) / total)}%` : "—";
+        ctx.ui.notify(`󰍛 ACM status: ${health?.status ?? "unavailable"}; mode=${mode.mode}; 󰓦 ${rate} ✓${bundleHits} ✗${bundleMisses}; 󰆼 ${ingestCount}; global bundle_injected=${values.bundle_injected ?? 0}; explicit_fetch=${values.explicit_fetch ?? 0}`, "info");
         return;
       }
       if (command === "browse") {
