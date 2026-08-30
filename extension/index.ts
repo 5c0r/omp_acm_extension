@@ -383,18 +383,25 @@ export default function acmExtension(pi: ExtensionAPI) {
         const refresh = async (memory: BrowseMemory) => (await acmRequest<BrowseMemory>(`/api/ui/memories/${memory.id}`)) ?? memory;
 
         for (;;) {
-          ctx.ui.notify(`ACM memory #${current.id} [${current.kind}] ${current.status}${current.pinned ? " · pinned" : ""}\n${current.content}`, "info");
-          const action = await ctx.ui.select("ACM memory actions", [
-            "Edit",
-            current.status === "active" ? "Archive" : "Restore",
-            current.pinned ? "Unpin" : "Pin",
-            "Set importance",
-            "Merge into…",
-            "Add alias",
-            ...(current.entities?.some(entity => entity.aliases?.length) ? ["Remove alias"] : []),
-            "Done",
-          ]);
+          const action = await ctx.ui.select(
+            `ACM memory #${current.id} [${current.kind}] ${current.status}${current.pinned ? " · pinned" : ""}`,
+            [
+              "View content",
+              "Edit",
+              current.status === "active" ? "Archive" : "Restore",
+              current.pinned ? "Unpin" : "Pin",
+              "Set importance",
+              "Merge into…",
+              "Add alias",
+              ...(current.entities?.some(entity => entity.aliases?.length) ? ["Remove alias"] : []),
+              "Done",
+            ],
+          );
           if (!action || action === "Done") return;
+          if (action === "View content") {
+            await ctx.ui.confirm(`ACM memory #${current.id} [${current.kind}] ${current.status}${current.pinned ? " · pinned" : ""}`, current.content);
+            continue;
+          }
 
           if (action === "Edit") {
             const content = await ctx.ui.editor(`Edit ACM memory #${current.id}`, current.content);

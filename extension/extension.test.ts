@@ -221,6 +221,57 @@ test("/acm browse passes string-only scope options to native UI", async () => {
 
 
 
+test("/acm browse blocks on full content before reopening actions", async () => {
+  const { commandHandlers } = extensionStub();
+  const handler = commandHandlers.acm;
+  expect(handler).toBeTypeOf("function");
+  if (!handler) return;
+
+  const content = "Widget API key rotates weekly; regenerate it through the internal secrets portal.";
+  const actionTitles: string[] = [];
+  const viewerCalls: Array<[string, string]> = [];
+  let actionCall = 0;
+  let signalViewer!: () => void;
+  let dismissViewer!: (value: boolean) => void;
+  const viewerOpened = new Promise<void>(resolve => { signalViewer = resolve; });
+  const viewerDismissed = new Promise<boolean>(resolve => { dismissViewer = resolve; });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    const address = String(url);
+    if (address.endsWith("/api/ui/dashboard")) return new Response(JSON.stringify({ totals: { scope: { "project:browse-live": 1 } } }));
+    if (address.includes("/api/ui/memories?")) return new Response(JSON.stringify({ items: [{ id: 41, kind: "fact", content, scope: "project:browse-live", status: "active", importance: 0.8, pinned: false }] }));
+    return new Response(JSON.stringify({ id: 41, kind: "fact", content, scope: "project:browse-live", status: "active", importance: 0.8, pinned: false, entities: [] }));
+  };
+  try {
+    const browsing = handler("browse", {
+      hasUI: true,
+      ui: {
+        select: async (title: string, options: string[]) => {
+          if (title === "ACM browse — scope" || title === "ACM browse — memory") return options[0];
+          if (title.startsWith("ACM memory #")) {
+            actionTitles.push(title);
+            return ["View content", "Done"][actionCall++];
+          }
+          return undefined;
+        },
+        confirm: async (title: string, message: string) => {
+          viewerCalls.push([title, message]);
+          signalViewer();
+          return viewerDismissed;
+        },
+      },
+    } as never);
+    await viewerOpened;
+    expect(viewerCalls).toEqual([["ACM memory #41 [fact] active", content]]);
+    expect(actionTitles).toEqual(["ACM memory #41 [fact] active"]);
+    dismissViewer(true);
+    await browsing;
+    expect(actionTitles).toEqual(["ACM memory #41 [fact] active", "ACM memory #41 [fact] active"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("/acm browse passes string-only memory and merge options to native UI", async () => {
   const { commandHandlers } = extensionStub();
   const handler = commandHandlers.acm;
@@ -248,7 +299,7 @@ test("/acm browse passes string-only memory and merge options to native UI", asy
           selectors.set(title, options);
           if (title === "ACM browse — scope") return "project:browse-live — 2 memories";
           if (title === "ACM browse — memory") return "#41 [fact] Source memory — active";
-          if (title === "ACM memory actions") return actions.shift();
+          if (title.startsWith("ACM memory #")) return actions.shift();
           return "#42 [fact] Target memory — active";
         },
         confirm: async () => true,
@@ -257,6 +308,7 @@ test("/acm browse passes string-only memory and merge options to native UI", asy
     } as never);
     expect(selectors.get("ACM browse — memory")).toEqual(["#41 [fact] Source memory — active", "#42 [fact] Target memory — active"]);
     expect(selectors.get("Merge into")).toEqual(["#42 [fact] Target memory — active"]);
+    expect([...selectors.entries()].find(([title]) => title.startsWith("ACM memory #"))?.[1]).toEqual(["View content", "Edit", "Archive", "Pin", "Set importance", "Merge into…", "Add alias", "Done"]);
   } finally {
     globalThis.fetch = originalFetch;
   }
