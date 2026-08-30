@@ -4,7 +4,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -12,7 +12,7 @@ from . import db
 from .anticipate import anticipate, get_bundle
 from .architect import generate_architecture
 from .compact import arm_compaction, compact, consolidate, match_compaction, start_compaction_worker
-from .ingest import start_worker, status as ingest_status, submit
+from .ingest import requeue_jobs, start_worker, status as ingest_status, submit
 from .retrieve import fetch, scope_id
 from .ui import manage_router, ui_router
 
@@ -123,11 +123,19 @@ def anticipate_turn(request: AnticipateRequest) -> dict[str, bool]:
 
 
 @app.get("/bundle/{session_id}")
-def bundle(session_id: str) -> dict[str, Any]:
-    result = get_bundle(session_id)
+def bundle(session_id: str, scope: str | None = None) -> dict[str, Any]:
+    result = get_bundle(session_id, scope)
     if not result:
         raise HTTPException(status_code=404, detail="bundle not found")
     return result
+
+
+@app.post("/requeue")
+def requeue(request: Request) -> dict[str, Any]:
+    """Explicit admin replay of reviewed failed/stale job IDs; never automatic."""
+    job_ids = request.query_params.get("job_ids", "")
+    ids = [int(value) for value in job_ids.split(",") if value.strip().isdigit()]
+    return {"revived": requeue_jobs(ids)}
 
 
 @app.post("/compact")

@@ -7,7 +7,10 @@ import threading
 from datetime import date
 from typing import Any
 
+import time
+
 import httpx
+import psycopg.errors
 
 from . import db
 from .architect import generate_architecture
@@ -26,6 +29,12 @@ _EXTRACT_SCHEMA = (
     '"entities":[{"name":"string","aliases":["string"],"role":"string"}]}],'
     '"relations":[{"from":"entity name","to":"entity name","relation":"string"}]}'
 )
+_TRIVIAL_RE = re.compile(
+    r"^(task not complete|consistency check (?:pass|fail)\W*|tried again\.?|no source module changed\.?|"
+    r"all objective evidence complete\.?|done\.?|ok\.?|pass\.?|fail\.?)$",
+    re.IGNORECASE,
+)
+
 
 
 def _scope_id(scope: str) -> int:
@@ -36,6 +45,7 @@ def _scope_id(scope: str) -> int:
     return db.get_or_create_scope(kind, name)
 
 
+
 def start_worker() -> None:
     global _worker
     with _worker_lock:
@@ -43,6 +53,26 @@ def start_worker() -> None:
             return
         _worker = threading.Thread(target=_run, name="acm-ingest", daemon=True)
         _worker.start()
+
+
+def requeue_jobs(job_ids: list[int]) -> list[int]:
+    """Admin-only explicit replay of reviewed job IDs (advisory: never auto-replay history at startup)."""
+    revived: list[int] = []
+    with db.connect() as conn:
+        for job_id in job_ids:
+            row = conn.execute(
+                "UPDATE ingest_job SET status = 'pending', "
+                "result = (COALESCE(result, '{}'::jsonb) - 'error' - 'reason') "
+                "|| jsonb_build_object('requeued', true, "
+                "'requeue_count', COALESCE((COALESCE(result, '{}'::jsonb) ->> 'requeue_count')::int, 0) + 1) "
+                "WHERE id = %s AND status IN ('failed', 'pending') "
+                "AND COALESCE(result, '{}'::jsonb) ->> 'requeued' IS NULL RETURNING id",
+                (job_id,),
+            ).fetchone()
+            if row:
+                _jobs.put(row["id"])
+                revived.append(row["id"])
+    return revived
 
 
 def submit(scope: str, text: str, source_ref: str | None = None) -> int:
@@ -69,7 +99,7 @@ def status(job_id: int) -> dict[str, Any]:
 def _finish(job_id: int, state: str, result: dict[str, Any]) -> None:
     with db.connect() as conn:
         conn.execute(
-            "UPDATE ingest_job SET status = %s, result = %s::jsonb WHERE id = %s",
+            "UPDATE ingest_job SET status = %s, result = COALESCE(result, '{}'::jsonb) || %s::jsonb WHERE id = %s",
             (state, json.dumps(result), job_id),
         )
 
@@ -100,6 +130,14 @@ def _extract(scope_id: int, text: str) -> dict[str, Any] | None:
     )
     if isinstance(extracted, dict) and isinstance(extracted.get("memories"), list) and extracted["memories"]:
         return extracted
+    time.sleep(2)  # one bounded re-ask before declaring extraction unavailable; chat_json already retried 3x inline
+    extracted = chat_json(
+        "Extract durable memories faithfully. Do not infer details not stated.",
+        f"Architecture:\n{json.dumps(architecture)}\n\nText:\n{text}",
+        _EXTRACT_SCHEMA,
+    )
+    if isinstance(extracted, dict) and isinstance(extracted.get("memories"), list) and extracted["memories"]:
+        return extracted
     return None
 
 
@@ -111,6 +149,9 @@ def _memory(scope_id: int, item: dict[str, Any], source_ref: str | None) -> int 
     if not content:
         return None
     kind = item.get("kind") if item.get("kind") in {"fact", "preference", "episode", "decision"} else "fact"
+    if kind == "fact" and (_TRIVIAL_RE.match(content.strip()) or len(content.split()) < 4):
+        # ponytail: word-count + observed status-noise kill-list; upgrade to model-graded relevance only if noise persists.
+        return None
     importance = item.get("importance", 0.5)
     importance = min(1.0, max(0.0, float(importance))) if isinstance(importance, (int, float)) else 0.5
     vector = _embedding(content)
@@ -237,7 +278,15 @@ def _run() -> None:
     while True:
         job_id = _jobs.get()
         try:
-            _process(job_id)
+            for attempt in range(3):
+                try:
+                    _process(job_id)
+                    break
+                except (psycopg.errors.DeadlockDetected, psycopg.errors.OperationalError) as err:
+                    if attempt == 2:
+                        _finish(job_id, "failed", {"error": str(err)})
+                        break
+                    time.sleep(0.5 * (attempt + 1))
         except Exception as err:  # worker failures must surface as job state, not kill future jobs
             _finish(job_id, "failed", {"error": str(err)})
         finally:
