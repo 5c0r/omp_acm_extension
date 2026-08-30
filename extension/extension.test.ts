@@ -2,7 +2,7 @@ import { expect, test, vi } from "bun:test";
 import { basename } from "node:path";
 
 
-import acmExtension, { shouldAutoArm } from "./index";
+import acmExtension, { renderStatusLine, shouldAutoArm } from "./index";
 
 type ExtensionHandler = (event: never, ctx: never) => Promise<unknown> | unknown;
 type RegisteredTool = {
@@ -71,6 +71,7 @@ test("registers complete ACM tool and command surface", () => {
 test("registers acm-mode flag", () => {
   expect(extensionStub().flags).toEqual([
     { name: "acm-mode", description: "ACM subsystem preset: full | memory | compaction", type: "string" },
+    { name: "acm-status", description: "ACM status line: on | off (also /acm status on|off at runtime)", type: "string" },
   ]);
 });
 
@@ -90,7 +91,7 @@ test("session start probes health then renders connected status footer", async (
   };
   try {
     await sessionStart({} as never, { hasUI: true, ui: { setStatus } } as never);
-    expect(setStatus).toHaveBeenCalledWith("acm", "ACM full · connected");
+    expect(setStatus).toHaveBeenCalledWith("acm", "󰍛 ACM full · connected");
   } finally {
     globalThis.fetch = originalFetch;
     if (previousWidget === undefined) delete process.env.ACM_WIDGET;
@@ -135,8 +136,8 @@ test("known-offline session freezes failures then recovers without a phantom mis
       "http://localhost:8927/bundle/offline-session",
       "http://localhost:8927/bundle/offline-session",
     ]);
-    expect(setStatus).toHaveBeenNthCalledWith(1, "acm", "ACM full · offline");
-    expect(setStatus).toHaveBeenNthCalledWith(2, "acm", "ACM full · bundle ✓1 ✗0 · ingest 0 · last compact —");
+    expect(setStatus).toHaveBeenNthCalledWith(1, "acm", "󰍛 ACM full · offline");
+    expect(setStatus).toHaveBeenNthCalledWith(2, "acm", "󰍛 full · 󰓦 100% ✓1 ✗0 · 󰆼 0 · 󰔉 —");
     expect(setWidget).not.toHaveBeenCalled();
   } finally {
     globalThis.fetch = originalFetch;
@@ -162,7 +163,7 @@ test("/acm status reports service health and stats", async () => {
   try {
     await handler("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
     expect(urls).toEqual(["http://localhost:8927/health", "http://localhost:8927/stats"]);
-    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=3; explicit_fetch=2; session ✓0 ✗0; ingest 0"]);
+    expect(notices).toEqual(["󰍛 ACM status: ok; mode=full; 󰓦 — ✓0 ✗0; 󰆼 0; global bundle_injected=3; explicit_fetch=2"]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -518,7 +519,7 @@ test("tools route scoped requests to ACM endpoints", async () => {
     ]);
     expect(setStatus).toHaveBeenCalledWith(
       "acm",
-      "ACM full · bundle ✓0 ✗0 · ingest 0 · last compact 0.90/0.20",
+      "󰍛 full · 󰓦 — ✓0 ✗0 · 󰆼 0 · 󰔉 0.90/0.20",
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -697,7 +698,7 @@ test("armed compaction match keeps unrelated preserve data but discards stale pa
     });
     expect(setStatus).toHaveBeenCalledWith(
       "acm",
-      "ACM compaction · bundle — · ingest 0 · last compact 0.90/0.20",
+      "󰍛 compaction · 󰓦 — · 󰆼 0 · 󰔉 0.90/0.20",
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -742,7 +743,7 @@ test("context prepends only a ready session bundle", async () => {
     });
     expect(setStatus).toHaveBeenCalledWith(
       "acm",
-      "ACM full · bundle ✓1 ✗0 · ingest 0 · last compact —",
+      "󰍛 full · 󰓦 100% ✓1 ✗0 · 󰆼 0 · 󰔉 —",
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -773,7 +774,7 @@ test("context records a widget miss when bundle is unavailable", async () => {
     );
     expect(setStatus).toHaveBeenCalledWith(
       "acm",
-      "ACM full · bundle ✓0 ✗1 · ingest 0 · last compact —",
+      "󰍛 full · 󰓦 0% ✓0 ✗1 · 󰆼 0 · 󰔉 —",
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -1150,12 +1151,12 @@ test("agent end enqueues only newly harvested transcript messages", async () => 
     expect(setStatus).toHaveBeenNthCalledWith(
       1,
       "acm",
-      "ACM full · bundle ✓0 ✗0 · ingest 3 · last compact —",
+      "󰍛 full · 󰓦 — ✓0 ✗0 · 󰆼 3 · 󰔉 —",
     );
     expect(setStatus).toHaveBeenNthCalledWith(
       2,
       "acm",
-      "ACM full · bundle ✓0 ✗0 · ingest 5 · last compact —",
+      "󰍛 full · 󰓦 — ✓0 ✗0 · 󰆼 5 · 󰔉 —",
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -1260,7 +1261,7 @@ test("--acm-mode selects memory when ACM_MODE is unset", async () => {
   globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
   try {
     await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
-    expect(notices).toEqual(["ACM status: ok; mode=memory; bundle_injected=0; explicit_fetch=0; session ✓0 ✗0; ingest 0"]);
+    expect(notices).toEqual(["󰍛 ACM status: ok; mode=memory; 󰓦 — ✓0 ✗0; 󰆼 0; global bundle_injected=0; explicit_fetch=0"]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;
@@ -1279,7 +1280,7 @@ test("ACM_MODE overrides --acm-mode", async () => {
   globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : { stats: {} }));
   try {
     await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
-    expect(notices).toEqual(["ACM status: ok; mode=compaction; bundle_injected=0; explicit_fetch=0; session ✓0 ✗0; ingest 0"]);
+    expect(notices).toEqual(["󰍛 ACM status: ok; mode=compaction; 󰓦 — ✓0 ✗0; 󰆼 0; global bundle_injected=0; explicit_fetch=0"]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;
@@ -1299,7 +1300,7 @@ test("unknown ACM_MODE warns once and falls back to full", async () => {
     expect(warnings).toEqual([]);
     await handler?.("status", { ui: { notify: (message: string) => notices.push(message) } } as never);
     expect(warnings).toEqual(["ACM mode 'not-a-mode' unknown; falling back to 'full' (expected full | memory | compaction)"]);
-    expect(notices).toEqual(["ACM status: ok; mode=full; bundle_injected=0; explicit_fetch=0; session ✓0 ✗0; ingest 0"]);
+    expect(notices).toEqual(["󰍛 ACM status: ok; mode=full; 󰓦 — ✓0 ✗0; 󰆼 0; global bundle_injected=0; explicit_fetch=0"]);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;
@@ -1337,7 +1338,7 @@ test("compaction context renders the widget without fetching a bundle", async ()
     expect(urls).toEqual([]);
     expect(setStatus).toHaveBeenCalledWith(
       "acm",
-      "ACM compaction · bundle — · ingest 0 · last compact —",
+      "󰍛 compaction · 󰓦 — · 󰆼 0 · 󰔉 —",
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -1429,5 +1430,57 @@ test("memory mode retains automatic ingestion and anticipation but skips compact
     globalThis.fetch = originalFetch;
     if (originalMode === undefined) delete process.env.ACM_MODE;
     else process.env.ACM_MODE = originalMode;
+  }
+});
+
+test("acm status on/off toggles the status line at runtime", async () => {
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const { commandHandlers } = extensionStub();
+  const setStatus = vi.fn();
+  const notify = vi.fn();
+  const ctx = { hasUI: true, ui: { setStatus, notify } } as never;
+  try {
+    await commandHandlers.acm("status off", ctx);
+    expect(notify).toHaveBeenCalledWith("󰍛 ACM status line off", "info");
+    expect(setStatus).toHaveBeenCalledWith("acm", undefined);
+    await commandHandlers.acm("status on", ctx);
+    expect(notify).toHaveBeenCalledWith("󰍛 ACM status line on", "info");
+  } finally {
+    if (previousWidget !== undefined) process.env.ACM_WIDGET = previousWidget;
+    else delete process.env.ACM_WIDGET;
+  }
+});
+
+test("status line benchmark shows hit rate with nerd font icons", () => {
+  expect(renderStatusLine({ mode: "full", bundleHits: 3, bundleMisses: 1, ingestCount: 7, lastCompaction: undefined }))
+    .toBe("󰍛 full · 󰓦 75% ✓3 ✗1 · 󰆼 7 · 󰔉 —");
+  expect(renderStatusLine({ mode: "full", bundleHits: 0, bundleMisses: 0, ingestCount: 0, lastCompaction: undefined }))
+    .toBe("󰍛 full · 󰓦 — ✓0 ✗0 · 󰆼 0 · 󰔉 —");
+  expect(renderStatusLine({ mode: "full", bundleHits: 0, bundleMisses: 0, ingestCount: 0, lastCompaction: undefined, online: false }))
+    .toBe("󰍛 ACM full · offline");
+});
+
+test("acm-status flag applied after factory still hides the status line", async () => {
+  // OMP applies CLI extension-flag values AFTER factories run; the read must be lazy.
+  const previousWidget = process.env.ACM_WIDGET;
+  delete process.env.ACM_WIDGET;
+  const stub = extensionStub();
+  const sessionStart = stub.handlers.session_start;
+  if (!sessionStart) return;
+  const originalFetch = globalThis.fetch;
+  const setStatus = vi.fn();
+  globalThis.fetch = async url => new Response(JSON.stringify(String(url).endsWith("/health") ? { status: "ok" } : {}));
+  try {
+    stub.setFlag("off"); // two-pass: value arrives only now, post-factory
+    await sessionStart({} as never, { hasUI: true, ui: { setStatus } } as never);
+    expect(setStatus).not.toHaveBeenCalled();
+    stub.setFlag(undefined);
+    await sessionStart({} as never, { hasUI: true, ui: { setStatus } } as never);
+    expect(setStatus).toHaveBeenCalledWith("acm", "󰍛 ACM full · connected");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousWidget !== undefined) process.env.ACM_WIDGET = previousWidget;
+    else delete process.env.ACM_WIDGET;
   }
 });

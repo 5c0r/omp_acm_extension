@@ -57,7 +57,18 @@ CREATE TABLE IF NOT EXISTS usage_log (
 );
 CREATE INDEX IF NOT EXISTS usage_log_memory_idx ON usage_log (memory_id);
 CREATE INDEX IF NOT EXISTS usage_log_ts_idx ON usage_log (ts);
+-- Per-session/per-scope bundle outcomes: partitionable hit-rate metrics (usage_log stays memory-rows only).
+CREATE TABLE IF NOT EXISTS bundle_event (
+    id         bigserial PRIMARY KEY,
+    session_id text,
+    scope      text,
+    outcome    text NOT NULL CHECK (outcome IN ('hit', 'miss')),
+    ts         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS bundle_event_scope_idx ON bundle_event (scope, outcome);
+CREATE INDEX IF NOT EXISTS bundle_event_session_idx ON bundle_event (session_id, id DESC) WHERE scope IS NOT NULL;
 
+ALTER TABLE bundle_event ADD COLUMN IF NOT EXISTS id bigserial;
 CREATE TABLE IF NOT EXISTS entity (
     id             serial PRIMARY KEY,
     scope_id       integer NOT NULL REFERENCES scope(id) ON DELETE CASCADE,
@@ -158,21 +169,24 @@ def connect():
 
 
 def ensure_schema() -> None:
+    """Idempotent, but DDL runs once per process: every request calls this via _scope_id,
+    and re-running CREATE/ALTER takes relation locks that deadlock against worker DML."""
     global _seeded
-    with connect() as conn:
-        conn.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK,))
-        try:
-            conn.execute(_DDL)
-        finally:
-            conn.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK,))
+    if _seeded:
+        return
     with _seed_lock:
         if _seeded:
             return
         with connect() as conn:
-            conn.execute(
-                "INSERT INTO scope (kind, name, parent_id) VALUES ('user', 'default', NULL) "
-                "ON CONFLICT (kind, name) DO NOTHING"
-            )
+            conn.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK,))
+            try:
+                conn.execute(_DDL)
+                conn.execute(
+                    "INSERT INTO scope (kind, name, parent_id) VALUES ('user', 'default', NULL) "
+                    "ON CONFLICT (kind, name) DO NOTHING"
+                )
+            finally:
+                conn.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK,))
         _seeded = True
 
 

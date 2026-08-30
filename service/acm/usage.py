@@ -31,6 +31,33 @@ def log_usage(memory_ids: Iterable[int], use_type: str, session_id: str | None =
         _LOG.warning("ACM usage log failed", exc_info=True)
 
 
+def log_bundle_event(session_id: str | None, scope: str | None, outcome: str) -> None:
+    """Record a bundle serve outcome (hit/miss) partitionable by session and scope."""
+    try:
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO bundle_event (session_id, scope, outcome) VALUES (%s, %s, %s)",
+                (session_id, scope, outcome),
+            )
+    except Exception:
+        _LOG.warning("ACM bundle event log failed", exc_info=True)
+
+
+def last_event_scope(session_id: str | None) -> str | None:
+    """Best-effort scope for a bundle read with no live row (expired/invalidated)."""
+    if not session_id:
+        return None
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT scope FROM bundle_event WHERE session_id = %s AND scope IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row["scope"] if row else None
+    except Exception:
+        return None
+
+
 def log_compaction_usage(session_id: str | None, scope: str | None) -> None:
     """Attribute a completed compaction to memories served since this session's prior compact."""
     if not session_id or not scope:

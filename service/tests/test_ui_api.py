@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import uuid
 
 _OLLAMA_URL = os.environ.get("ACM_OLLAMA_URL")
@@ -375,3 +376,139 @@ def test_entity_alias_can_be_removed() -> None:
 
     assert response.status_code == 200
     assert response.json()["aliases"] == []
+
+
+def test_bundle_events_record_hit_and_scope_resolved_miss() -> None:
+    """Bundle serves must leave partitionable hit/miss rows; expired misses resolve scope from event history."""
+    scope = _scope()
+    hit_session = f"bundle-{uuid.uuid4().hex}"
+    expired_session = f"bundle-{uuid.uuid4().hex}"
+    cold_session = f"bundle-{uuid.uuid4().hex}"
+
+    with TestClient(app) as client:
+        memory_id = _memory(scope, "ACM bundle event fixture records rotation cadence quarterly.")
+        for session_id, expiry in ((hit_session, "5 minutes"), (expired_session, "5 minutes")):
+            with db.connect() as conn:
+                conn.execute(
+                    "INSERT INTO bundle (session_id, scope_id, rendered, predicted_intents, memory_ids, memory_ids_version, expires_at) "
+                    "VALUES (%s, %s, %s, '[]'::jsonb, %s::jsonb, 1, now() + interval '5 minutes')",
+                    (session_id, _scope_id(scope), "[acm memory]", json.dumps([memory_id])),
+                )
+            assert client.get(f"/bundle/{session_id}").status_code == 200  # establishes scoped history
+        with db.connect() as conn:
+            conn.execute("UPDATE bundle SET expires_at = now() - interval '1 minute' WHERE session_id = %s", (expired_session,))
+
+        assert client.get(f"/bundle/{hit_session}").status_code == 200
+        assert client.get(f"/bundle/{expired_session}").status_code == 404
+        assert client.get(f"/bundle/{cold_session}").status_code == 404
+
+        with db.connect() as conn:
+            events = conn.execute(
+                "SELECT session_id, scope, outcome FROM bundle_event WHERE session_id = ANY(%s) ORDER BY id",
+                ([hit_session, expired_session, cold_session],),
+            ).fetchall()
+    by_session = {(e["session_id"], e["outcome"]): e["scope"] for e in events}
+    assert (hit_session, "hit") in by_session and (expired_session, "miss") in by_session
+    assert by_session[(expired_session, "miss")] == scope, "miss scope must fall back to the session's event history"
+    cold_scope = by_session.get((cold_session, "miss"), "absent")
+    assert cold_scope is None or cold_scope == "absent", "never-seen session has no knowable scope"
+
+
+def test_requeue_replays_failed_job_through_worker() -> None:
+    """Explicit /requeue must revive a reviewed failed job and drive it back through the worker to a terminal state."""
+    scope = _scope()
+    with TestClient(app) as client:
+        ingested = client.post("/ingest", json={"scope": scope, "text": "Requeue fixture: vault tokens rotate every 30 days at midnight."})
+        assert ingested.status_code == 202
+        job_id = ingested.json()["job_id"]
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE ingest_job SET status = 'failed', result = '{\"error\": \"deadlock detected\"}'::jsonb WHERE id = %s",
+                (job_id,),
+            )
+
+        revived = client.post(f"/requeue?job_ids={job_id}")
+        assert revived.status_code == 200
+        assert revived.json()["revived"] == [job_id]
+
+        # In-process suite runs with a dead Ollama URL, so replay terminates as a fresh
+        # extraction failure — proving the job re-entered the worker, which is the fix's contract.
+        for _ in range(30):
+            row = client.get(f"/status/{job_id}").json()
+            if row["status"] in {"done", "failed"} and row["result"].get("requeued"):
+                break
+            time.sleep(0.5)
+        assert row["status"] == "failed" and row["result"].get("reason") == "extraction unavailable", row
+
+        # second requeue of a terminal, already-requeued job is a no-op
+        assert client.post(f"/requeue?job_ids={job_id}").json()["revived"] == []
+
+
+def test_ensure_schema_runs_ddl_once_per_process() -> None:
+    """Every request calls ensure_schema via _scope_id; DDL must not re-run or it locks against worker DML."""
+    import acm.db as db_module
+
+    original_connect = db_module.connect
+    ddl_runs = 0
+    seed_runs = 0
+
+    def counting_connect():
+        nonlocal ddl_runs, seed_runs
+        conn = original_connect()
+        original_execute = conn.execute
+
+        def execute(query, *args, **kwargs):
+            nonlocal ddl_runs, seed_runs
+            if "CREATE TABLE IF NOT EXISTS scope" in str(query):
+                ddl_runs += 1
+            if "user', 'default'" in str(query):
+                seed_runs += 1
+            return original_execute(query, *args, **kwargs)
+
+        conn.execute = execute
+        return conn
+
+    db_module._seeded = False
+    db_module.connect = counting_connect
+    try:
+        db_module.ensure_schema()
+        db_module.ensure_schema()
+        db_module.ensure_schema()
+    finally:
+        db_module.connect = original_connect
+
+    assert ddl_runs == 1 and seed_runs == 1, (ddl_runs, seed_runs)
+
+
+def test_requeue_replay_to_done_carries_no_stale_failure_fields() -> None:
+    """A successful replay must end done without stale error/reason keys."""
+    import acm.ingest as ingest_module
+
+    scope = _scope()
+    with TestClient(app) as client:
+        ingested = client.post("/ingest", json={"scope": scope, "text": "Requeue success fixture: deploys freeze on Fridays until Q3."})
+        job_id = ingested.json()["job_id"]
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE ingest_job SET status = 'failed', result = '{\"error\": \"deadlock detected\"}'::jsonb WHERE id = %s",
+                (job_id,),
+            )
+
+        def canned_extract(scope_id, text):
+            return {"memories": [{"kind": "fact", "content": "Deploys freeze on Fridays until Q3.", "importance": 0.6, "entities": []}], "relations": []}
+
+        original_extract = ingest_module._extract
+        ingest_module._extract = canned_extract
+        try:
+            assert client.post(f"/requeue?job_ids={job_id}").json()["revived"] == [job_id]
+            for _ in range(30):
+                row = client.get(f"/status/{job_id}").json()
+                if row["status"] in {"done", "failed"} and row["result"].get("requeued"):
+                    break
+                time.sleep(0.5)
+        finally:
+            ingest_module._extract = original_extract
+
+    assert row["status"] == "done", row
+    assert "error" not in row["result"] and "reason" not in row["result"], row["result"]
+    assert row["result"].get("requeue_count") == 1 and row["result"].get("memory_ids"), row["result"]

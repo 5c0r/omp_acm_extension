@@ -8,7 +8,7 @@ from .llm import chat_json, tokens
 from .sanitize import sanitize
 
 from .retrieve import fetch, scope_id
-from .usage import log_usage
+from .usage import last_event_scope, log_bundle_event, log_usage
 
 BUNDLE_TTL = timedelta(minutes=10)
 BUNDLE_BUDGET = 1500
@@ -79,8 +79,7 @@ def anticipate(session_id: str, scope: str, trajectory: list[dict[str, Any]]) ->
     return {"predicted_intents": intents, "rendered": rendered}
 
 
-def get_bundle(session_id: str) -> dict[str, Any] | None:
-    """Serve a current, provenance-backed session bundle without model or retrieval work."""
+def get_bundle(session_id: str, scope: str | None = None) -> dict[str, Any] | None:
     with db.connect() as conn:
         row = conn.execute(
             "UPDATE bundle SET served_count = served_count + 1 WHERE session_id = %s AND expires_at > now() "
@@ -89,6 +88,7 @@ def get_bundle(session_id: str) -> dict[str, Any] | None:
         ).fetchone()
         if not row:
             db.bump_stat("bundle_missed")
+            log_bundle_event(session_id, scope or last_event_scope(session_id), "miss")
             return None
         memory_ids = row.pop("memory_ids")
         if isinstance(memory_ids, str):
@@ -96,6 +96,7 @@ def get_bundle(session_id: str) -> dict[str, Any] | None:
         if row.pop("memory_ids_version") != 1 or not isinstance(memory_ids, list) or not all(isinstance(memory_id, int) for memory_id in memory_ids):
             conn.execute("DELETE FROM bundle WHERE session_id = %s", (session_id,))
             db.bump_stat("bundle_missed")
+            log_bundle_event(session_id, scope, "miss")
             return None
         active = conn.execute(
             "SELECT count(*) AS count FROM memory WHERE id = ANY(%s) AND status = 'active'",
@@ -104,9 +105,11 @@ def get_bundle(session_id: str) -> dict[str, Any] | None:
         if active != len(memory_ids):
             conn.execute("DELETE FROM bundle WHERE session_id = %s", (session_id,))
             db.bump_stat("bundle_missed")
+            log_bundle_event(session_id, scope, "miss")
             return None
         scope_row = conn.execute("SELECT kind, name FROM scope WHERE id = %s", (row["scope_id"],)).fetchone()
     row.pop("scope_id")
     db.bump_stat("bundle_injected")
+    log_bundle_event(session_id, f"{scope_row['kind']}:{scope_row['name']}", "hit")
     log_usage(memory_ids, "bundle", session_id=session_id, scope=f"{scope_row['kind']}:{scope_row['name']}")
     return {**row, "rendered": sanitize(row["rendered"])}
